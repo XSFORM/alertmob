@@ -366,6 +366,7 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
         ])
         buttons.append([
             InlineKeyboardButton("Мониторинг", callback_data="monitor"),
+            InlineKeyboardButton("Обновить бот", callback_data="update"),
         ])
 
     kb = InlineKeyboardMarkup(buttons)
@@ -467,6 +468,30 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.message.reply_text(f"Файл {name}.ovpn не найден в {OVPN_DIR}")
         await show_menu(update, ctx)
+        return
+
+    # --- Обновить бот ---
+    if data == "update":
+        await q.edit_message_text("Обновляю бот...")
+        try:
+            bot_dir = os.path.dirname(os.path.abspath(__file__))
+            r = subprocess.run(
+                ["git", "pull"], cwd=bot_dir,
+                capture_output=True, text=True, timeout=30
+            )
+            output = (r.stdout + r.stderr).strip()[-300:]
+            if "Already up to date" in output or "Already up-to-date" in output:
+                await q.message.reply_text("Уже последняя версия.")
+                await show_menu(update, ctx)
+            else:
+                await q.message.reply_text(
+                    f"<pre>{output}</pre>\n\nПерезапускаю...", parse_mode="HTML"
+                )
+                # Перезапуск через systemd
+                subprocess.Popen(["systemctl", "restart", "alertmob"])
+        except Exception as e:
+            await q.message.reply_text(f"Ошибка: {e}")
+            await show_menu(update, ctx)
         return
 
     # --- Мониторинг ---
