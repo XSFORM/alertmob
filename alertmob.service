@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root
-ExecStart=/usr/bin/python3 /root/bot.py
+WorkingDirectory=/root/alertmob
+ExecStart=/usr/bin/python3 /root/alertmob/bot.py
 Restart=on-failure
 RestartSec=5
 
