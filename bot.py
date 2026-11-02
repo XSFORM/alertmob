@@ -13,7 +13,7 @@ import subprocess
 import sys
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -335,10 +335,104 @@ def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
 
+BOTTOM_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("Создать"), KeyboardButton("Удалить")],
+        [KeyboardButton("Список"), KeyboardButton("Мониторинг")],
+        [KeyboardButton("Отправить .ovpn"), KeyboardButton("Обновить бот")],
+    ],
+    resize_keyboard=True
+)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    await update.message.reply_text("Клавиатура активна", reply_markup=BOTTOM_KB)
     await show_menu(update, ctx)
+
+
+async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str):
+    """Обработка быстрых кнопок снизу (ReplyKeyboard)."""
+    msg = update.message
+
+    if action == "create":
+        ctx.user_data["action"] = "create_name"
+        await msg.reply_text("Введи имя клиента (латиница, без пробелов):")
+        return
+
+    if action == "delete":
+        clients = list_clients()
+        if not clients:
+            await msg.reply_text("Нет клиентов.")
+            return
+        buttons = [[InlineKeyboardButton(f"× {c}", callback_data=f"del:{c}")] for c in clients]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await msg.reply_text("Выбери клиента:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "list":
+        clients = list_clients()
+        if clients:
+            text = "<b>Клиенты:</b>\n\n" + "\n".join(f"  {c}" for c in clients)
+            text += f"\n\nВсего: {len(clients)}"
+        else:
+            text = "Нет клиентов."
+        await msg.reply_text(text, parse_mode="HTML")
+        return
+
+    if action == "monitor":
+        online = parse_status_log()
+        all_clients = list_clients()
+        lines = []
+        total_rx, total_tx = 0, 0
+        for c in sorted(all_clients):
+            if c in online:
+                info = online[c]
+                vip = info.get("virtual_addr", "?")
+                rx, tx = info.get("rx", 0), info.get("tx", 0)
+                total_rx += rx
+                total_tx += tx
+                lines.append(f"  🟢 <b>{c}</b>  {vip}  ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)}")
+            else:
+                lines.append(f"  🔴 {c}")
+        client_block = "\n".join(lines) if lines else "Нет клиентов"
+        server = get_server_stats()
+        text = (
+            f"<b>Мониторинг</b>\n\nOnline: {len(online)} / {len(all_clients)}\n"
+            f"Трафик сессии: ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}\n\n"
+            f"{client_block}\n\n<b>Сервер:</b>\n{server}"
+        )
+        buttons = [[InlineKeyboardButton("Обновить", callback_data="monitor")]]
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if action == "send":
+        clients = list_clients()
+        if not clients:
+            await msg.reply_text("Нет клиентов.")
+            return
+        buttons = [[InlineKeyboardButton(c, callback_data=f"sf:{c}")] for c in clients]
+        await msg.reply_text("Выбери ключ:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "update":
+        await msg.reply_text("Обновляю бот...")
+        try:
+            bot_dir = os.path.dirname(os.path.abspath(__file__))
+            r = subprocess.run(
+                ["git", "pull"], cwd=bot_dir,
+                capture_output=True, text=True, timeout=30
+            )
+            output = (r.stdout + r.stderr).strip()[-300:]
+            if "Already up to date" in output or "Already up-to-date" in output:
+                await msg.reply_text("Уже последняя версия.")
+            else:
+                await msg.reply_text(f"<pre>{output}</pre>\n\nПерезапускаю...", parse_mode="HTML")
+                subprocess.Popen(["systemctl", "restart", "alertmob"])
+        except Exception as e:
+            await msg.reply_text(f"Ошибка: {e}")
+        return
 
 
 async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
@@ -541,6 +635,22 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     action = ctx.user_data.get("action")
+    text = update.message.text.strip()
+
+    # Быстрые кнопки снизу
+    quick = {
+        "Создать": "create",
+        "Удалить": "delete",
+        "Список": "list",
+        "Мониторинг": "monitor",
+        "Отправить .ovpn": "send",
+        "Обновить бот": "update",
+    }
+    if text in quick and action != "create_name":
+        # Имитируем нажатие inline-кнопки
+        ctx.user_data["quick_action"] = quick[text]
+        await handle_quick(update, ctx, quick[text])
+        return
 
     if action == "create_name":
         ctx.user_data.pop("action", None)
