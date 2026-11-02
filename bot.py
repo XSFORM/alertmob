@@ -187,6 +187,111 @@ def revoke_client(name: str) -> tuple:
         return False, f"Ошибка: {e}"
 
 
+# ======================== МОНИТОРИНГ ========================
+
+STATUS_LOG = "/etc/openvpn/server/openvpn-status.log"
+
+
+def parse_status_log() -> dict:
+    """Парсить openvpn-status.log → {name: {real_addr, virtual_addr, rx, tx, connected}}"""
+    clients = {}
+    if not os.path.exists(STATUS_LOG):
+        return clients
+
+    try:
+        with open(STATUS_LOG) as f:
+            section = None
+            for line in f:
+                line = line.strip()
+                if line.startswith("OpenVPN CLIENT LIST") or line.startswith("Common Name"):
+                    section = "clients"
+                    continue
+                if line.startswith("ROUTING TABLE"):
+                    section = "routing"
+                    continue
+                if line.startswith("GLOBAL STATS"):
+                    section = "stats"
+                    continue
+                if line.startswith("END") or line.startswith("Updated"):
+                    continue
+
+                if section == "clients" and "," in line:
+                    parts = line.split(",")
+                    if len(parts) >= 5:
+                        name = parts[0]
+                        if name == "Common Name":
+                            continue
+                        clients[name] = {
+                            "real_addr": parts[1].split(":")[0],
+                            "rx": int(parts[2]) if parts[2].isdigit() else 0,
+                            "tx": int(parts[3]) if parts[3].isdigit() else 0,
+                            "connected": parts[4],
+                        }
+
+                if section == "routing" and "," in line:
+                    parts = line.split(",")
+                    if len(parts) >= 4:
+                        vaddr = parts[0]
+                        name = parts[1]
+                        if name in clients and name != "Virtual Address":
+                            clients[name]["virtual_addr"] = vaddr
+    except Exception as e:
+        log.error(f"Ошибка чтения status.log: {e}")
+
+    return clients
+
+
+def fmt_bytes(b: int) -> str:
+    """Форматировать байты в читаемый вид."""
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024 * 1024:
+        return f"{b / 1024:.1f} KB"
+    elif b < 1024 * 1024 * 1024:
+        return f"{b / (1024*1024):.1f} MB"
+    else:
+        return f"{b / (1024*1024*1024):.2f} GB"
+
+
+def get_server_stats() -> str:
+    """Статистика сервера: uptime, нагрузка, трафик интерфейса."""
+    lines = []
+
+    # Uptime
+    try:
+        with open("/proc/uptime") as f:
+            sec = int(float(f.read().split()[0]))
+            d, rem = divmod(sec, 86400)
+            h, rem = divmod(rem, 3600)
+            m = rem // 60
+            lines.append(f"Uptime: {d}d {h}h {m}m")
+    except Exception:
+        pass
+
+    # Load average
+    try:
+        with open("/proc/loadavg") as f:
+            load = f.read().split()[:3]
+            lines.append(f"Load: {' '.join(load)}")
+    except Exception:
+        pass
+
+    # tun0 traffic
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                if "tun0" in line:
+                    parts = line.split()
+                    rx = int(parts[1])
+                    tx = int(parts[9])
+                    lines.append(f"tun0 RX: {fmt_bytes(rx)} | TX: {fmt_bytes(tx)}")
+                    break
+    except Exception:
+        pass
+
+    return "\n".join(lines) if lines else "Нет данных"
+
+
 # ======================== TELEGRAM BOT ========================
 
 ADMIN_ID = 0  # Заполняется при старте
@@ -224,6 +329,9 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
         buttons.append([
             InlineKeyboardButton("Список", callback_data="list"),
             InlineKeyboardButton("Отправить .ovpn", callback_data="send"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("Мониторинг", callback_data="monitor"),
         ])
 
     kb = InlineKeyboardMarkup(buttons)
@@ -325,6 +433,42 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.message.reply_text(f"Файл {name}.ovpn не найден в {OVPN_DIR}")
         await show_menu(update, ctx)
+        return
+
+    # --- Мониторинг ---
+    if data == "monitor":
+        online = parse_status_log()
+        all_clients = list_clients()
+
+        lines = []
+        total_rx, total_tx = 0, 0
+
+        for c in sorted(all_clients):
+            if c in online:
+                info = online[c]
+                vip = info.get("virtual_addr", "?")
+                rx, tx = info.get("rx", 0), info.get("tx", 0)
+                total_rx += rx
+                total_tx += tx
+                lines.append(f"  🟢 <b>{c}</b>  {vip}  ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)}")
+            else:
+                lines.append(f"  🔴 {c}")
+
+        client_block = "\n".join(lines) if lines else "Нет клиентов"
+        server = get_server_stats()
+
+        text = (
+            f"<b>Мониторинг</b>\n\n"
+            f"Online: {len(online)} / {len(all_clients)}\n"
+            f"Трафик сессии: ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}\n\n"
+            f"{client_block}\n\n"
+            f"<b>Сервер:</b>\n{server}"
+        )
+        buttons = [
+            [InlineKeyboardButton("Обновить", callback_data="monitor")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
     # --- Назад ---
