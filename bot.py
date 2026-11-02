@@ -189,52 +189,86 @@ def revoke_client(name: str) -> tuple:
 
 # ======================== МОНИТОРИНГ ========================
 
-STATUS_LOG = "/etc/openvpn/server/openvpn-status.log"
+STATUS_LOGS = [
+    "/var/log/openvpn/status.log",
+    "/etc/openvpn/server/openvpn-status.log",
+    "/run/openvpn-server/status-server.log",
+]
+
+
+def find_status_log() -> str:
+    for p in STATUS_LOGS:
+        if os.path.exists(p):
+            return p
+    return ""
 
 
 def parse_status_log() -> dict:
-    """Парсить openvpn-status.log → {name: {real_addr, virtual_addr, rx, tx, connected}}"""
+    """Парсить status.log (v2/v3 формат с префиксами)."""
     clients = {}
-    if not os.path.exists(STATUS_LOG):
+    path = find_status_log()
+    if not path:
         return clients
 
     try:
-        with open(STATUS_LOG) as f:
-            section = None
+        with open(path) as f:
             for line in f:
                 line = line.strip()
-                if line.startswith("OpenVPN CLIENT LIST") or line.startswith("Common Name"):
-                    section = "clients"
-                    continue
-                if line.startswith("ROUTING TABLE"):
-                    section = "routing"
-                    continue
-                if line.startswith("GLOBAL STATS"):
-                    section = "stats"
-                    continue
-                if line.startswith("END") or line.startswith("Updated"):
-                    continue
 
-                if section == "clients" and "," in line:
+                # CLIENT_LIST,name,real_addr,virtual_addr,ipv6,bytes_rx,bytes_tx,connected,...
+                if line.startswith("CLIENT_LIST,"):
                     parts = line.split(",")
-                    if len(parts) >= 5:
-                        name = parts[0]
-                        if name == "Common Name":
-                            continue
+                    if len(parts) >= 7:
+                        name = parts[1]
+                        real_addr = parts[2].replace("udp4:", "").replace("tcp4:", "").split(":")[0]
+                        vaddr = parts[3]
+                        try:
+                            rx = int(parts[5])
+                        except (ValueError, IndexError):
+                            rx = 0
+                        try:
+                            tx = int(parts[6])
+                        except (ValueError, IndexError):
+                            tx = 0
+                        connected = parts[7] if len(parts) > 7 else ""
                         clients[name] = {
-                            "real_addr": parts[1].split(":")[0],
-                            "rx": int(parts[2]) if parts[2].isdigit() else 0,
-                            "tx": int(parts[3]) if parts[3].isdigit() else 0,
-                            "connected": parts[4],
+                            "real_addr": real_addr,
+                            "virtual_addr": vaddr,
+                            "rx": rx,
+                            "tx": tx,
+                            "connected": connected,
                         }
 
-                if section == "routing" and "," in line:
+                # Fallback: старый формат без префиксов
+                elif not line.startswith(("HEADER,", "ROUTING_TABLE,", "GLOBAL_STATS,",
+                                          "TITLE,", "TIME,", "END")):
                     parts = line.split(",")
-                    if len(parts) >= 4:
-                        vaddr = parts[0]
-                        name = parts[1]
-                        if name in clients and name != "Virtual Address":
+                    if len(parts) >= 5 and parts[0] not in ("Common Name", "Virtual Address", ""):
+                        # Может быть строка клиента старого формата
+                        name = parts[0]
+                        if "." in parts[1] or ":" in parts[1]:  # похоже на адрес
+                            try:
+                                clients[name] = {
+                                    "real_addr": parts[1].split(":")[0],
+                                    "virtual_addr": "",
+                                    "rx": int(parts[2]) if parts[2].isdigit() else 0,
+                                    "tx": int(parts[3]) if parts[3].isdigit() else 0,
+                                    "connected": parts[4] if len(parts) > 4 else "",
+                                }
+                            except (ValueError, IndexError):
+                                pass
+
+        # Добить virtual_addr из ROUTING_TABLE
+        with open(path) as f:
+            for line in f:
+                if line.startswith("ROUTING_TABLE,"):
+                    parts = line.split(",")
+                    if len(parts) >= 3:
+                        vaddr = parts[1]
+                        name = parts[2]
+                        if name in clients and not clients[name].get("virtual_addr"):
                             clients[name]["virtual_addr"] = vaddr
+
     except Exception as e:
         log.error(f"Ошибка чтения status.log: {e}")
 
