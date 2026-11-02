@@ -118,10 +118,14 @@ def list_clients() -> list:
         if r.returncode == 0 and r.stdout.strip():
             clients = []
             for line in r.stdout.strip().splitlines():
-                name = line.strip()
-                # Пропускаем заголовки и пустые строки
-                if name and name != "server" and not name.startswith("Name") and "---" not in name:
-                    clients.append(name)
+                line = line.strip()
+                # Пропускаем заголовки, инфо-строки и пустые
+                if not line or line.startswith("===") or line.startswith("[") or line.startswith("---") or line.startswith("Name"):
+                    continue
+                # Формат: "name  Valid  2036-10-30  3649 days"
+                parts = line.split()
+                if parts and parts[0] != "server":
+                    clients.append(parts[0])
             if clients:
                 return sorted(set(clients))
     except Exception:
@@ -148,9 +152,10 @@ def create_client(name: str) -> tuple:
         return False, "OpenVPN не установлен!", None
 
     try:
+        # "1" = без пароля (ответ на интерактивный вопрос)
         r = subprocess.run(
-            ["bash", INSTALL_SCRIPT, "client", "add", name, "--no-pass"],
-            capture_output=True, text=True, timeout=60
+            ["bash", INSTALL_SCRIPT, "client", "add", name],
+            input="1\n", capture_output=True, text=True, timeout=60
         )
         ovpn = os.path.join(OVPN_DIR, f"{name}.ovpn")
         if os.path.exists(ovpn):
