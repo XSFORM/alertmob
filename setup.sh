@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
-# AlertMob — быстрая установка OpenVPN + Telegram бот
-# Запуск: bash setup.sh
+# AlertMob — установка бота на чистый сервер
+# Один файл: bash setup.sh
+# OpenVPN ставится потом через кнопку в боте
 # ============================================================
 set -e
 
@@ -10,21 +11,24 @@ echo "  AlertMob — Setup"
 echo "======================================"
 echo ""
 
-# --- 1. Системные пакеты ---
-echo "[1/4] Устанавливаю зависимости..."
+# --- 1. Зависимости ---
+echo "[1/3] Устанавливаю зависимости..."
 apt update -qq
-apt install -y -qq python3 python3-pip curl > /dev/null 2>&1
+apt install -y -qq python3 python3-pip curl git > /dev/null 2>&1
 pip install python-telegram-bot --break-system-packages -q 2>/dev/null || pip install python-telegram-bot -q
-echo "  ✓ Python + telegram-bot установлены"
+echo "  ✓ Python + telegram-bot + git установлены"
 
-# --- 2. Скачать angristan ---
-echo "[2/4] Скачиваю OpenVPN installer..."
-curl -sSL -o /root/openvpn-install.sh https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
-chmod +x /root/openvpn-install.sh
-echo "  ✓ openvpn-install.sh готов"
+# --- 2. Скачать бота ---
+echo "[2/3] Скачиваю бота..."
+if [ -d "/root/alertmob" ]; then
+    cd /root/alertmob && git pull -q
+else
+    git clone -q https://github.com/XSFORM/alertmob.git /root/alertmob
+fi
+echo "  ✓ alertmob готов"
 
-# --- 3. Настройка бота ---
-echo "[3/4] Настройка Telegram бота..."
+# --- 3. Настройка ---
+echo "[3/3] Настройка Telegram бота..."
 echo ""
 
 # Запросить TOKEN
@@ -47,32 +51,25 @@ while true; do
     fi
 done
 
-# Записать config.env
-cat > /root/alertmob_config.env << EOF
-BOT_TOKEN=${BOT_TOKEN}
-ADMIN_ID=${ADMIN_ID}
+# Записать config.json
+cat > /root/alertmob/config.json << EOF
+{
+  "token": "${BOT_TOKEN}",
+  "admin_id": ${ADMIN_ID}
+}
 EOF
-echo "  ✓ Конфиг сохранён в /root/alertmob_config.env"
+echo "  ✓ Конфиг сохранён"
 
-# --- 4. Установка OpenVPN ---
-echo "[4/4] Запускаю установку OpenVPN..."
-echo ""
-echo "  Выбирай: tls-crypt-v2, AES-128-GCM, ECDSA, UDP 1194"
-echo "  ─────────────────────────────────────────────────────"
-echo ""
-bash /root/openvpn-install.sh interactive
+# --- Systemd ---
+cp /root/alertmob/alertmob.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now alertmob
 
 echo ""
 echo "======================================"
-echo "  Установка завершена!"
+echo "  Бот запущен!"
 echo ""
-echo "  Запуск бота:"
-echo "    python3 /root/bot.py"
-echo ""
-echo "  Фоновый запуск:"
-echo "    nohup python3 /root/bot.py &> /root/bot.log &"
-echo ""
-echo "  Systemd (автозапуск):"
-echo "    cp alertmob.service /etc/systemd/system/"
-echo "    systemctl enable --now alertmob"
+echo "  Открой бота в Telegram → /start"
+echo "  Нажми «Установить OpenVPN»"
+echo "  Всё остальное — через бота."
 echo "======================================"

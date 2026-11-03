@@ -676,13 +676,75 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- Установка ---
     if data == "install":
-        await q.edit_message_text(
-            "Запускаю установку OpenVPN...\n\n"
-            "Используй <code>bash /root/openvpn-install.sh interactive</code> "
-            "в терминале для интерактивной настройки.\n\n"
-            "После установки нажми /start",
-            parse_mode="HTML"
-        )
+        await q.edit_message_text("Скачиваю и устанавливаю OpenVPN tls-crypt-v2...\nЭто займёт 1-3 минуты.")
+
+        try:
+            # Скачать скрипт
+            subprocess.run(
+                ["curl", "-sSL", "-o", INSTALL_SCRIPT,
+                 "https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh"],
+                capture_output=True, timeout=30
+            )
+            os.chmod(INSTALL_SCRIPT, 0o755)
+
+            # Определить IP
+            ip = get_public_ip()
+
+            # Автоустановка с tls-crypt-v2
+            env = os.environ.copy()
+            env.update({
+                "AUTO_INSTALL": "y",
+                "APPROVE_INSTALL": "y",
+                "APPROVE_IP": "y",
+                "ENDPOINT": ip,
+                "IPV6_SUPPORT": "n",
+                "PORT_CHOICE": "1",
+                "PROTOCOL_CHOICE": "1",
+                "DNS": "3",
+                "COMPRESSION_ENABLED": "n",
+                "CUSTOMIZE_ENC": "y",
+                "CIPHER_CHOICE": "1",
+                "CERT_TYPE": "1",
+                "CERT_CURVE_CHOICE": "1",
+                "CC_CIPHER_CHOICE": "1",
+                "DH_TYPE": "1",
+                "DH_CURVE_CHOICE": "1",
+                "HMAC_ALG_CHOICE": "1",
+                "TLS_SIG": "3",
+                "CLIENT": "first-client",
+                "PASS": "1",
+            })
+
+            r = subprocess.run(
+                ["bash", INSTALL_SCRIPT],
+                env=env, capture_output=True, text=True, timeout=300
+            )
+
+            if openvpn_installed():
+                await q.message.reply_text(
+                    f"OpenVPN установлен!\n\n"
+                    f"IP: <code>{ip}</code>\n"
+                    f"Порт: UDP 1194\n"
+                    f"Защита: tls-crypt-v2\n"
+                    f"Шифр: AES-128-GCM\n\n"
+                    f"Первый клиент: <b>first-client</b>",
+                    parse_mode="HTML"
+                )
+                ovpn = os.path.join(OVPN_DIR, "first-client.ovpn")
+                if os.path.exists(ovpn):
+                    await q.message.reply_document(
+                        document=InputFile(open(ovpn, "rb"), filename="first-client.ovpn"),
+                        caption="first-client.ovpn"
+                    )
+            else:
+                err = (r.stderr or r.stdout or "нет вывода")[-800:]
+                await q.message.reply_text(f"Ошибка установки:\n<pre>{err}</pre>", parse_mode="HTML")
+        except subprocess.TimeoutExpired:
+            await q.message.reply_text("Таймаут установки (>5 мин)")
+        except Exception as e:
+            await q.message.reply_text(f"Ошибка: {e}")
+
+        await show_menu(update, ctx)
         return
 
     # --- Создать ---
