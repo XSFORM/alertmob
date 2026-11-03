@@ -272,6 +272,79 @@ def get_disabled_clients() -> set:
     return disabled
 
 
+# ======================== БЭКАП / ВОССТАНОВЛЕНИЕ ========================
+
+import tarfile
+import datetime
+
+BACKUP_DIR = "/root/alertmob_backups"
+
+
+def create_backup() -> tuple:
+    """Создать бэкап OpenVPN + бота → tar.gz. Возвращает (success, msg, path)."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BACKUP_DIR, f"alertmob_backup_{ts}.tar.gz")
+
+    dirs_to_backup = [
+        "/etc/openvpn/server",        # конфиги, сертификаты, easy-rsa, ccd
+        "/root/alertmob/config.json",  # конфиг бота
+    ]
+    # Все .ovpn файлы в /root/
+    ovpn_files = [f"/root/{f}" for f in os.listdir("/root") if f.endswith(".ovpn")]
+
+    try:
+        with tarfile.open(backup_path, "w:gz") as tar:
+            for path in dirs_to_backup:
+                if os.path.exists(path):
+                    tar.add(path)
+            for f in ovpn_files:
+                if os.path.exists(f):
+                    tar.add(f)
+            # openvpn-install.sh
+            if os.path.exists(INSTALL_SCRIPT):
+                tar.add(INSTALL_SCRIPT)
+
+        size = os.path.getsize(backup_path)
+        return True, f"Бэкап создан ({fmt_bytes(size)})", backup_path
+    except Exception as e:
+        return False, f"Ошибка: {e}", None
+
+
+def restore_backup(backup_path: str) -> tuple:
+    """Восстановить из tar.gz бэкапа."""
+    if not os.path.exists(backup_path):
+        return False, "Файл не найден"
+
+    try:
+        with tarfile.open(backup_path, "r:gz") as tar:
+            # Проверить что внутри есть /etc/openvpn
+            members = tar.getnames()
+            has_openvpn = any("openvpn" in m for m in members)
+            if not has_openvpn:
+                return False, "Не похоже на бэкап OpenVPN"
+            tar.extractall("/", filter="data")
+
+        # Перезапустить OpenVPN
+        subprocess.run(["systemctl", "restart", "openvpn-server@server"], timeout=15)
+        return True, "Восстановлено. OpenVPN перезапущен."
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+
+def list_backups() -> list:
+    """Список бэкапов."""
+    if not os.path.exists(BACKUP_DIR):
+        return []
+    files = []
+    for f in sorted(os.listdir(BACKUP_DIR), reverse=True):
+        if f.endswith(".tar.gz"):
+            path = os.path.join(BACKUP_DIR, f)
+            size = os.path.getsize(path)
+            files.append({"name": f, "path": path, "size": size})
+    return files
+
+
 # ======================== МОНИТОРИНГ ========================
 
 STATUS_LOGS = [
@@ -425,7 +498,7 @@ BOTTOM_KB = ReplyKeyboardMarkup(
         [KeyboardButton("Создать"), KeyboardButton("Удалить")],
         [KeyboardButton("Вкл/Выкл"), KeyboardButton("Мониторинг")],
         [KeyboardButton("Список"), KeyboardButton("Отправить .ovpn")],
-        [KeyboardButton("Обновить бот")],
+        [KeyboardButton("Бэкап"), KeyboardButton("Обновить бот")],
     ],
     resize_keyboard=True
 )
@@ -519,6 +592,20 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
             return
         buttons = [[InlineKeyboardButton(c, callback_data=f"sf:{c}")] for c in clients]
         await msg.reply_text("Выбери ключ:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if action == "backup":
+        buttons = [
+            [InlineKeyboardButton("Создать бэкап", callback_data="backup_create")],
+            [InlineKeyboardButton("Скачать последний", callback_data="backup_download")],
+            [InlineKeyboardButton("Восстановить", callback_data="backup_restore")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
+        ]
+        backups = list_backups()
+        text = f"<b>Бэкап</b>\n\nСохранённых: {len(backups)}"
+        if backups:
+            text += f"\nПоследний: {backups[0]['name']} ({fmt_bytes(backups[0]['size'])})"
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
     if action == "update":
@@ -722,6 +809,61 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Вкл/Выкл клиентов:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    # --- Бэкап ---
+    if data == "backup_create":
+        await q.edit_message_text("Создаю бэкап...")
+        ok, msg, path = create_backup()
+        await q.message.reply_text(msg, parse_mode="HTML")
+        if ok and path:
+            try:
+                await q.message.reply_document(
+                    document=InputFile(open(path, "rb"), filename=os.path.basename(path)),
+                    caption="Бэкап OpenVPN"
+                )
+            except Exception:
+                await q.message.reply_text(f"Файл на сервере: <code>{path}</code>", parse_mode="HTML")
+        await show_menu(update, ctx)
+        return
+
+    if data == "backup_download":
+        backups = list_backups()
+        if not backups:
+            await q.edit_message_text("Нет бэкапов. Сначала создай.")
+            await show_menu(update, ctx)
+            return
+        latest = backups[0]
+        try:
+            await q.message.reply_document(
+                document=InputFile(open(latest["path"], "rb"), filename=latest["name"]),
+                caption=f"Последний бэкап ({fmt_bytes(latest['size'])})"
+            )
+        except Exception as e:
+            await q.message.reply_text(f"Ошибка отправки: {e}")
+        await show_menu(update, ctx)
+        return
+
+    if data == "backup_restore":
+        backups = list_backups()
+        if not backups:
+            await q.edit_message_text("Нет бэкапов.")
+            await show_menu(update, ctx)
+            return
+        buttons = [[InlineKeyboardButton(f"{b['name']} ({fmt_bytes(b['size'])})",
+                     callback_data=f"restore:{b['name']}")] for b in backups[:5]]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.edit_message_text("Выбери бэкап для восстановления:",
+                                  reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("restore:"):
+        name = data[8:]
+        path = os.path.join(BACKUP_DIR, name)
+        await q.edit_message_text(f"Восстанавливаю {name}...")
+        ok, msg = restore_backup(path)
+        await q.message.reply_text(msg, parse_mode="HTML")
+        await show_menu(update, ctx)
+        return
+
     # --- Обновить бот ---
     if data == "update":
         await q.edit_message_text("Обновляю бот...")
@@ -803,6 +945,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Список": "list",
         "Мониторинг": "monitor",
         "Отправить .ovpn": "send",
+        "Бэкап": "backup",
         "Обновить бот": "update",
     }
     if text in quick and action != "create_name":
