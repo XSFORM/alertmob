@@ -187,6 +187,91 @@ def revoke_client(name: str) -> tuple:
         return False, f"Ошибка: {e}"
 
 
+# ======================== БЛОКИРОВКА ========================
+
+CCD_DIR = "/etc/openvpn/server/ccd"
+
+
+def ensure_ccd():
+    """Убедиться что CCD включён в конфиге и папка существует."""
+    os.makedirs(CCD_DIR, exist_ok=True)
+    # Проверить что client-config-dir есть в server.conf
+    try:
+        with open(SERVER_CONF) as f:
+            conf = f.read()
+        if "client-config-dir" not in conf:
+            with open(SERVER_CONF, "a") as f:
+                f.write(f"\nclient-config-dir {CCD_DIR}\n")
+            # Перезапустить OpenVPN чтобы подхватил CCD
+            subprocess.run(["systemctl", "restart", "openvpn-server@server"], timeout=15)
+            log.info("CCD добавлен в server.conf, OpenVPN перезапущен")
+    except Exception as e:
+        log.error(f"ensure_ccd: {e}")
+
+
+def is_client_disabled(name: str) -> bool:
+    """Проверить отключён ли клиент."""
+    ccd_file = os.path.join(CCD_DIR, name)
+    if not os.path.exists(ccd_file):
+        return False
+    with open(ccd_file) as f:
+        return "disable" in f.read()
+
+
+def disable_client(name: str) -> tuple:
+    """Отключить клиента (disable в CCD)."""
+    ensure_ccd()
+    try:
+        ccd_file = os.path.join(CCD_DIR, name)
+        with open(ccd_file, "w") as f:
+            f.write("disable\n")
+        # Кикнуть если онлайн — через management или kill
+        kick_client(name)
+        return True, f"Клиент <b>{name}</b> отключён"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+
+def enable_client(name: str) -> tuple:
+    """Включить клиента (убрать disable из CCD)."""
+    try:
+        ccd_file = os.path.join(CCD_DIR, name)
+        if os.path.exists(ccd_file):
+            os.remove(ccd_file)
+        return True, f"Клиент <b>{name}</b> включён"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+
+def kick_client(name: str):
+    """Принудительно отключить клиента если он онлайн."""
+    try:
+        # Через management interface (если включён)
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect(("127.0.0.1", 7505))
+        sock.recv(1024)
+        sock.send(f"kill {name}\n".encode())
+        sock.recv(1024)
+        sock.close()
+    except Exception:
+        # Fallback: найти PID клиента и убить через ipp.txt не получится,
+        # но disable сработает при следующем реконнекте
+        pass
+
+
+def get_disabled_clients() -> set:
+    """Список отключённых клиентов."""
+    disabled = set()
+    if not os.path.exists(CCD_DIR):
+        return disabled
+    for name in os.listdir(CCD_DIR):
+        if is_client_disabled(name):
+            disabled.add(name)
+    return disabled
+
+
 # ======================== МОНИТОРИНГ ========================
 
 STATUS_LOGS = [
@@ -338,8 +423,9 @@ def is_admin(update: Update) -> bool:
 BOTTOM_KB = ReplyKeyboardMarkup(
     [
         [KeyboardButton("Создать"), KeyboardButton("Удалить")],
-        [KeyboardButton("Список"), KeyboardButton("Мониторинг")],
-        [KeyboardButton("Отправить .ovpn"), KeyboardButton("Обновить бот")],
+        [KeyboardButton("Вкл/Выкл"), KeyboardButton("Мониторинг")],
+        [KeyboardButton("Список"), KeyboardButton("Отправить .ovpn")],
+        [KeyboardButton("Обновить бот")],
     ],
     resize_keyboard=True
 )
@@ -381,13 +467,32 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
         await msg.reply_text(text, parse_mode="HTML")
         return
 
+    if action == "toggle":
+        clients = list_clients()
+        if not clients:
+            await msg.reply_text("Нет клиентов.")
+            return
+        disabled = get_disabled_clients()
+        buttons = []
+        for c in clients:
+            if c in disabled:
+                buttons.append([InlineKeyboardButton(f"🔴 {c} → Включить", callback_data=f"enable:{c}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"🟢 {c} → Отключить", callback_data=f"disable:{c}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await msg.reply_text("Вкл/Выкл клиентов:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     if action == "monitor":
         online = parse_status_log()
         all_clients = list_clients()
+        disabled = get_disabled_clients()
         lines = []
         total_rx, total_tx = 0, 0
         for c in sorted(all_clients):
-            if c in online:
+            if c in disabled:
+                lines.append(f"  ⛔ {c}  (отключён)")
+            elif c in online:
                 info = online[c]
                 vip = info.get("virtual_addr", "?")
                 rx, tx = info.get("rx", 0), info.get("tx", 0)
@@ -564,6 +669,59 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, ctx)
         return
 
+    # --- Вкл/Выкл ---
+    if data == "toggle":
+        clients = list_clients()
+        if not clients:
+            await q.edit_message_text("Нет клиентов.")
+            await show_menu(update, ctx)
+            return
+        disabled = get_disabled_clients()
+        buttons = []
+        for c in clients:
+            if c in disabled:
+                buttons.append([InlineKeyboardButton(f"🔴 {c} → Включить", callback_data=f"enable:{c}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"🟢 {c} → Отключить", callback_data=f"disable:{c}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.edit_message_text("Вкл/Выкл клиентов:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("disable:"):
+        name = data[8:]
+        ok, msg = disable_client(name)
+        await q.edit_message_text(msg, parse_mode="HTML")
+        await asyncio.sleep(1)
+        # Показать обновлённый список toggle
+        clients = list_clients()
+        disabled = get_disabled_clients()
+        buttons = []
+        for c in clients:
+            if c in disabled:
+                buttons.append([InlineKeyboardButton(f"🔴 {c} → Включить", callback_data=f"enable:{c}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"🟢 {c} → Отключить", callback_data=f"disable:{c}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.message.reply_text("Вкл/Выкл клиентов:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("enable:"):
+        name = data[7:]
+        ok, msg = enable_client(name)
+        await q.edit_message_text(msg, parse_mode="HTML")
+        await asyncio.sleep(1)
+        clients = list_clients()
+        disabled = get_disabled_clients()
+        buttons = []
+        for c in clients:
+            if c in disabled:
+                buttons.append([InlineKeyboardButton(f"🔴 {c} → Включить", callback_data=f"enable:{c}")])
+            else:
+                buttons.append([InlineKeyboardButton(f"🟢 {c} → Отключить", callback_data=f"disable:{c}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.message.reply_text("Вкл/Выкл клиентов:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
     # --- Обновить бот ---
     if data == "update":
         await q.edit_message_text("Обновляю бот...")
@@ -641,6 +799,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     quick = {
         "Создать": "create",
         "Удалить": "delete",
+        "Вкл/Выкл": "toggle",
         "Список": "list",
         "Мониторинг": "monitor",
         "Отправить .ovpn": "send",
