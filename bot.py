@@ -717,7 +717,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             })
 
             r = subprocess.run(
-                ["bash", INSTALL_SCRIPT],
+                ["bash", INSTALL_SCRIPT, "install"],
                 env=env, capture_output=True, text=True, timeout=300
             )
 
