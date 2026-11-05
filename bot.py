@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import logging
+import html as html_escape
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -162,7 +163,7 @@ def create_client(name: str) -> tuple:
             return True, f"Клиент <b>{name}</b> создан", ovpn
         else:
             err = (r.stderr or r.stdout or "нет вывода")[-500:]
-            return False, f"Ошибка создания:\n<pre>{err}</pre>", None
+            return False, f"Ошибка создания:\n<pre>{html_escape.escape(err)}</pre>", None
     except subprocess.TimeoutExpired:
         return False, "Таймаут (>60 сек)", None
     except Exception as e:
@@ -620,7 +621,7 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
             if "Already up to date" in output or "Already up-to-date" in output:
                 await msg.reply_text("Уже последняя версия.")
             else:
-                await msg.reply_text(f"<pre>{output}</pre>\n\nПерезапускаю...", parse_mode="HTML")
+                await msg.reply_text(f"<pre>{html_escape.escape(output)}</pre>\n\nПерезапускаю...", parse_mode="HTML")
                 subprocess.Popen(["systemctl", "restart", "alertmob"])
         except Exception as e:
             await msg.reply_text(f"Ошибка: {e}")
@@ -738,7 +739,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
             else:
                 err = (r.stderr or r.stdout or "нет вывода")[-800:]
-                await q.message.reply_text(f"Ошибка установки:\n<pre>{err}</pre>", parse_mode="HTML")
+                await q.message.reply_text(f"Ошибка установки:\n<pre>{html_escape.escape(err)}</pre>", parse_mode="HTML")
         except subprocess.TimeoutExpired:
             await q.message.reply_text("Таймаут установки (>5 мин)")
         except Exception as e:
@@ -941,7 +942,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await show_menu(update, ctx)
             else:
                 await q.message.reply_text(
-                    f"<pre>{output}</pre>\n\nПерезапускаю...", parse_mode="HTML"
+                    f"<pre>{html_escape.escape(output)}</pre>\n\nПерезапускаю...", parse_mode="HTML"
                 )
                 # Перезапуск через systemd
                 subprocess.Popen(["systemctl", "restart", "alertmob"])
