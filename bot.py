@@ -342,18 +342,19 @@ def format_ip_table(client_ips: list) -> str:
     return "<b>📍 IP адреса клиентов</b>\n\n<pre>" + "\n".join(lines) + "</pre>"
 
 
-# ======================== ФРОНТ-СЕРВЕРЫ (SSH) ========================
+# ======================== ФРОНТ-СЕРВЕРЫ / SSH / МОНИТОРИНГ ========================
 
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONT_SERVERS_FILE = os.path.join(BOT_DIR, "front_servers.json")
+IP_TRACK_FILE = os.path.join(BOT_DIR, "ip_track.json")
 SSH_TIMEOUT = 10
 SSH_CMD_TIMEOUT = 30
 
-# IP-мониторинг
+# IP-мониторинг (автоматический, по данным из .ovpn файлов)
 TM_PROBE_IP = "217.174.235.161"
 IP_FAIL_THRESHOLD = 3
 IP_CHECK_INTERVAL = 60  # секунд
-ip_fail_counts = {}  # {client_name: int}
+ip_fail_counts = {}  # {ip: int}
 
 # GOST
 GOST_BIN = "/usr/local/bin/gost"
@@ -362,7 +363,7 @@ GOST_REPO = "ginuerzh/gost"
 
 
 def load_front_servers() -> dict:
-    """Загрузить данные фронт-серверов. {client_name: {ip, ssh_user, ssh_pass, label}}"""
+    """Загрузить данные фронт-серверов (GOST). {client_name: {ip, ssh_user, ssh_pass, gost_rules}}"""
     if os.path.exists(FRONT_SERVERS_FILE):
         try:
             with open(FRONT_SERVERS_FILE) as f:
@@ -379,6 +380,53 @@ def save_front_servers(data: dict):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, FRONT_SERVERS_FILE)
+
+
+# --- Автоматическое отслеживание IP из .ovpn ---
+
+def load_ip_track() -> dict:
+    """Загрузить файл отслеживания IP. {ip: [client_name, ...]}"""
+    if os.path.exists(IP_TRACK_FILE):
+        try:
+            with open(IP_TRACK_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception):
+            pass
+    return {}
+
+
+def save_ip_track(data: dict):
+    tmp = IP_TRACK_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, IP_TRACK_FILE)
+
+
+def sync_ip_track() -> dict:
+    """Прочитать все .ovpn файлы и обновить ip_track.json.
+    Возвращает {ip: [client_name, ...]} — группировка по IP."""
+    ip_map = {}  # ip -> [names]
+    for name in list_clients():
+        ip, port = get_client_remote(name)
+        if ip and ip != "—":
+            ip_map.setdefault(ip, []).append(name)
+
+    old = load_ip_track()
+    if ip_map != old:
+        save_ip_track(ip_map)
+        # Лог изменений
+        old_ips = set(old.keys())
+        new_ips = set(ip_map.keys())
+        added = new_ips - old_ips
+        removed = old_ips - new_ips
+        if added:
+            log.info(f"[ip_track] Новые IP: {', '.join(added)}")
+        if removed:
+            log.info(f"[ip_track] Убраны IP: {', '.join(removed)}")
+
+    return ip_map
 
 
 def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
@@ -468,51 +516,60 @@ def gost_build_service(rules: list) -> str:
 
 
 async def ip_block_monitor(app):
-    """Фоновая задача: каждые 60 сек проверяет IP каждого ключа через SSH-пинг.
-    Если 3 раза подряд пинг не проходит — IP заблокирован, шлём уведомление."""
+    """Фоновая задача: каждые 60 сек читает IP из .ovpn файлов,
+    SSH-ится на каждый фронт и пингует TM-зонд (217.174.235.161).
+    Если 3 раза подряд пинг не проходит — IP заблокирован, шлём уведомление.
+
+    SSH-логин/пароль берутся из config.json (front_ssh_user / front_ssh_pass).
+    IP автоматически берутся из .ovpn файлов — не нужно добавлять вручную."""
     global ip_fail_counts
     while True:
         try:
             await asyncio.sleep(IP_CHECK_INTERVAL)
-            fronts = load_front_servers()
-            if not fronts:
+
+            # Глобальные SSH-данные из конфига
+            cfg = load_config()
+            ssh_user = cfg.get("front_ssh_user", "").strip()
+            ssh_pass = cfg.get("front_ssh_pass", "").strip()
+            if not ssh_user or not ssh_pass:
+                continue  # SSH фронтов не настроен — пропуск
+
+            # Синхронизировать IP из .ovpn файлов
+            ip_map = sync_ip_track()  # {ip: [client1, client2, ...]}
+            if not ip_map:
                 continue
 
-            for client_name, srv in fronts.items():
-                front_ip = srv.get("ip")
-                if not front_ip or not srv.get("ssh_user") or not srv.get("ssh_pass"):
-                    continue
-
+            # Проверить каждый уникальный IP
+            for front_ip, clients in ip_map.items():
                 try:
                     ok = await asyncio.to_thread(
-                        ping_via_ssh, front_ip,
-                        srv["ssh_user"], srv["ssh_pass"],
+                        ping_via_ssh, front_ip, ssh_user, ssh_pass,
                         TM_PROBE_IP
                     )
                 except Exception as e:
-                    log.error(f"[ip_monitor] SSH error for {client_name} ({front_ip}): {e}")
+                    log.error(f"[ip_monitor] SSH error {front_ip}: {e}")
                     ok = False
 
                 if ok:
-                    if ip_fail_counts.get(client_name, 0) > 0:
-                        log.info(f"[ip_monitor] {client_name} ({front_ip}) — пинг ОК, сброс счётчика")
-                    ip_fail_counts[client_name] = 0
+                    if ip_fail_counts.get(front_ip, 0) > 0:
+                        log.info(f"[ip_monitor] {front_ip} — пинг ОК, сброс ({', '.join(clients)})")
+                    ip_fail_counts[front_ip] = 0
                     continue
 
-                ip_fail_counts[client_name] = ip_fail_counts.get(client_name, 0) + 1
-                count = ip_fail_counts[client_name]
-                log.warning(f"[ip_monitor] {client_name} ({front_ip}) — FAIL #{count}/{IP_FAIL_THRESHOLD}")
+                ip_fail_counts[front_ip] = ip_fail_counts.get(front_ip, 0) + 1
+                count = ip_fail_counts[front_ip]
+                log.warning(f"[ip_monitor] {front_ip} — FAIL #{count}/{IP_FAIL_THRESHOLD} ({', '.join(clients)})")
 
                 if count >= IP_FAIL_THRESHOLD:
-                    # IP заблокирован — отправить уведомление
-                    ip_fail_counts[client_name] = 0  # сбросить, чтобы не спамить
+                    ip_fail_counts[front_ip] = 0  # сбросить, чтобы не спамить
+                    clients_str = ", ".join(f"<b>{c}</b>" for c in clients)
                     try:
                         await app.bot.send_message(
                             chat_id=ADMIN_ID,
                             text=(
                                 f"🚫 <b>IP ЗАБЛОКИРОВАН</b>\n\n"
-                                f"Клиент: <b>{client_name}</b>\n"
-                                f"IP фронта: <code>{front_ip}</code>\n"
+                                f"IP: <code>{front_ip}</code>\n"
+                                f"Ключи: {clients_str}\n"
                                 f"Пинг {TM_PROBE_IP} не прошёл {IP_FAIL_THRESHOLD} раз подряд.\n\n"
                                 f"Нужна смена IP!"
                             ),
@@ -864,13 +921,24 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
 
     if action == "gost_menu":
         fronts = load_front_servers()
-        text = f"<b>🔒 GOST / Фронты</b>\n\nФронт-серверов: {len(fronts)}"
-        if fronts:
-            lines = []
-            for cname, srv in fronts.items():
-                lines.append(f"  <code>{srv.get('ip', '?')}</code> — {cname}")
-            text += "\n\n" + "\n".join(lines)
+        cfg = load_config()
+        ssh_ok = bool(cfg.get("front_ssh_user") and cfg.get("front_ssh_pass"))
+        ip_map = sync_ip_track()
+
+        text = f"<b>🔒 GOST / Фронты</b>\n\n"
+        text += f"Мониторинг IP: {'✅ активен' if ssh_ok else '❌ SSH не настроен'}\n"
+        text += f"Отслеживаемых IP: {len(ip_map)}\n"
+        text += f"Фронт-серверов (GOST): {len(fronts)}"
+
+        if ip_map:
+            text += "\n\n<b>IP из .ovpn:</b>\n"
+            for ip, clients in ip_map.items():
+                text += f"  <code>{ip}</code> — {', '.join(clients)}\n"
+
         buttons = [
+            [InlineKeyboardButton(
+                f"🔑 SSH фронтов {'✅' if ssh_ok else '❌'}",
+                callback_data="front_ssh_setup")],
             [InlineKeyboardButton("➕ Добавить фронт", callback_data="front_add")],
             [InlineKeyboardButton("📋 Список фронтов", callback_data="front_list")],
             [InlineKeyboardButton("⬇️ Установить GOST", callback_data="gost_install_select")],
@@ -1204,13 +1272,24 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # --- GOST / Фронт-серверы ---
     if data == "gost_menu":
         fronts = load_front_servers()
-        text = f"<b>🔒 GOST / Фронты</b>\n\nФронт-серверов: {len(fronts)}"
-        if fronts:
-            lines = []
-            for cname, srv in fronts.items():
-                lines.append(f"  <code>{srv.get('ip', '?')}</code> — {cname}")
-            text += "\n\n" + "\n".join(lines)
+        cfg = load_config()
+        ssh_ok = bool(cfg.get("front_ssh_user") and cfg.get("front_ssh_pass"))
+        ip_map = sync_ip_track()
+
+        text = f"<b>🔒 GOST / Фронты</b>\n\n"
+        text += f"Мониторинг IP: {'✅ активен' if ssh_ok else '❌ SSH не настроен'}\n"
+        text += f"Отслеживаемых IP: {len(ip_map)}\n"
+        text += f"Фронт-серверов (GOST): {len(fronts)}"
+
+        if ip_map:
+            text += "\n\n<b>IP из .ovpn:</b>\n"
+            for ip, clients in ip_map.items():
+                text += f"  <code>{ip}</code> — {', '.join(clients)}\n"
+
         buttons = [
+            [InlineKeyboardButton(
+                f"🔑 SSH фронтов {'✅' if ssh_ok else '❌'}",
+                callback_data="front_ssh_setup")],
             [InlineKeyboardButton("➕ Добавить фронт", callback_data="front_add")],
             [InlineKeyboardButton("📋 Список фронтов", callback_data="front_list")],
             [InlineKeyboardButton("⬇️ Установить GOST", callback_data="gost_install_select")],
@@ -1218,6 +1297,42 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Назад", callback_data="back")],
         ]
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data == "front_ssh_setup":
+        cfg = load_config()
+        ssh_user = cfg.get("front_ssh_user", "")
+        ssh_pass = cfg.get("front_ssh_pass", "")
+        if ssh_user:
+            text = (
+                f"<b>🔑 SSH доступ к фронтам</b>\n\n"
+                f"Логин: <code>{ssh_user}</code>\n"
+                f"Пароль: <code>{'*' * len(ssh_pass)}</code>\n\n"
+                "Эти данные используются для проверки блокировки IP.\n"
+                "Бот SSH-ится на каждый фронт и пингует TM-зонд."
+            )
+        else:
+            text = (
+                "<b>🔑 SSH доступ к фронтам</b>\n\n"
+                "Не настроен.\n\n"
+                "Для мониторинга блокировки IP нужен SSH доступ к фронт-серверам.\n"
+                "Бот будет SSH-иться на каждый IP из .ovpn файлов и проверять пинг."
+            )
+        buttons = [
+            [InlineKeyboardButton("✏️ Задать логин/пароль", callback_data="front_ssh_edit")],
+            [InlineKeyboardButton("Назад", callback_data="gost_menu")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data == "front_ssh_edit":
+        ctx.user_data["action"] = "front_ssh_user_input"
+        await q.edit_message_text(
+            "<b>Настройка SSH фронтов</b>\n\n"
+            "Введи SSH логин (общий для всех фронт-серверов):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="gost_menu")]])
+        )
         return
 
     if data == "front_add":
@@ -1595,6 +1710,61 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Имитируем нажатие inline-кнопки
         ctx.user_data["quick_action"] = quick[text]
         await handle_quick(update, ctx, quick[text])
+        return
+
+    # --- Настройка глобального SSH для фронтов ---
+    if action == "front_ssh_user_input":
+        ctx.user_data.pop("action", None)
+        ctx.user_data["front_ssh_user_new"] = text
+        ctx.user_data["action"] = "front_ssh_pass_input"
+        await update.message.reply_text(
+            f"Логин: <code>{text}</code>\n\nВведи SSH пароль:",
+            parse_mode="HTML"
+        )
+        return
+
+    if action == "front_ssh_pass_input":
+        ctx.user_data.pop("action", None)
+        ssh_user = ctx.user_data.pop("front_ssh_user_new", "")
+        ssh_pass = text
+        if not ssh_user:
+            await show_menu(update, ctx)
+            return
+        # Сохранить в конфиг
+        cfg = load_config()
+        cfg["front_ssh_user"] = ssh_user
+        cfg["front_ssh_pass"] = ssh_pass
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+        # Проверить на первом доступном IP
+        ip_map = sync_ip_track()
+        test_ip = next(iter(ip_map), None) if ip_map else None
+        if test_ip:
+            await update.message.reply_text(f"Проверяю SSH {ssh_user}@{test_ip}...")
+            ok, out = await asyncio.to_thread(ssh_exec, test_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
+            if ok and "SSH_OK" in out:
+                await update.message.reply_text(
+                    f"✅ SSH настроен и проверен!\n\n"
+                    f"Логин: <code>{ssh_user}</code>\n"
+                    f"Тест: <code>{test_ip}</code> — ОК\n\n"
+                    f"Мониторинг {len(ip_map)} IP активирован.",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"⚠️ SSH сохранён, но тест не прошёл:\n"
+                    f"<pre>{html_escape.escape(out[:500])}</pre>\n\n"
+                    f"Проверь логин/пароль. Мониторинг может не работать.",
+                    parse_mode="HTML"
+                )
+        else:
+            await update.message.reply_text(
+                f"✅ SSH сохранён: <code>{ssh_user}</code>\n\n"
+                f"Нет .ovpn ключей для проверки.",
+                parse_mode="HTML"
+            )
+        await show_menu(update, ctx)
         return
 
     # --- Добавление фронт-сервера (пошаговый ввод) ---
