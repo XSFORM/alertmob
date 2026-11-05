@@ -273,6 +273,59 @@ def get_disabled_clients() -> set:
     return disabled
 
 
+# ======================== IP АДРЕСА (ФРОНТЫ) ========================
+
+import re
+
+def get_client_remote(name: str) -> tuple:
+    """Прочитать remote IP и порт из .ovpn файла. → (ip, port) или (None, None)."""
+    ovpn = os.path.join(OVPN_DIR, f"{name}.ovpn")
+    if not os.path.exists(ovpn):
+        return None, None
+    try:
+        with open(ovpn) as f:
+            for line in f:
+                m = re.match(r'^remote\s+(\S+)\s+(\d+)', line)
+                if m:
+                    return m.group(1), m.group(2)
+    except Exception:
+        pass
+    return None, None
+
+
+def set_client_remote_ip(name: str, new_ip: str) -> tuple:
+    """Заменить IP в строке remote у .ovpn файла, порт оставить. → (success, message)."""
+    ovpn = os.path.join(OVPN_DIR, f"{name}.ovpn")
+    if not os.path.exists(ovpn):
+        return False, f"Файл {name}.ovpn не найден"
+    try:
+        with open(ovpn) as f:
+            lines = f.readlines()
+        found = False
+        for i, line in enumerate(lines):
+            m = re.match(r'^(remote\s+)\S+(\s+\d+.*)$', line)
+            if m:
+                lines[i] = f"{m.group(1)}{new_ip}{m.group(2)}\n"
+                found = True
+                break
+        if not found:
+            return False, "Строка remote не найдена в файле"
+        with open(ovpn, "w") as f:
+            f.writelines(lines)
+        return True, f"IP клиента <b>{name}</b> изменён на <code>{new_ip}</code>"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+
+
+def get_all_client_ips() -> list:
+    """Список всех клиентов с их remote IP. → [(name, ip, port), ...]"""
+    result = []
+    for name in list_clients():
+        ip, port = get_client_remote(name)
+        result.append((name, ip or "—", port or "—"))
+    return result
+
+
 # ======================== БЭКАП / ВОССТАНОВЛЕНИЕ ========================
 
 import tarfile
@@ -499,7 +552,8 @@ BOTTOM_KB = ReplyKeyboardMarkup(
         [KeyboardButton("Создать"), KeyboardButton("Удалить")],
         [KeyboardButton("Вкл/Выкл"), KeyboardButton("Мониторинг")],
         [KeyboardButton("Список"), KeyboardButton("Отправить .ovpn")],
-        [KeyboardButton("Бэкап"), KeyboardButton("Обновить бот")],
+        [KeyboardButton("📍 IP адреса"), KeyboardButton("Бэкап")],
+        [KeyboardButton("Обновить бот")],
     ],
     resize_keyboard=True
 )
@@ -595,6 +649,20 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
         await msg.reply_text("Выбери ключ:", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
+    if action == "ip_list":
+        client_ips = get_all_client_ips()
+        if not client_ips:
+            await msg.reply_text("Нет клиентов.")
+            return
+        lines = []
+        for name, ip, port in client_ips:
+            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
+        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
+        buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
     if action == "backup":
         buttons = [
             [InlineKeyboardButton("Создать бэкап", callback_data="backup_create")],
@@ -635,12 +703,14 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
     if installed:
         status = f"OpenVPN: работает\nКлиентов: {len(clients)}"
     else:
-        status = "OpenVPN: не установлен\n\nУстановите OpenVPN вручную перед использованием бота."
+        status = "OpenVPN: не установлен"
 
     text = f"<b>AlertMob VPN</b>\n\n{status}"
 
     buttons = []
-    if installed:
+    if not installed:
+        buttons.append([InlineKeyboardButton("OpenVPN не установлен", callback_data="back")])
+    else:
         buttons.append([
             InlineKeyboardButton("Создать", callback_data="create"),
             InlineKeyboardButton("Удалить", callback_data="delete"),
@@ -648,6 +718,9 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
         buttons.append([
             InlineKeyboardButton("Список", callback_data="list"),
             InlineKeyboardButton("Отправить .ovpn", callback_data="send"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("📍 IP адреса", callback_data="ip_list"),
         ])
         buttons.append([
             InlineKeyboardButton("Мониторинг", callback_data="monitor"),
@@ -672,6 +745,40 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
+
+    # --- IP адреса (фронты) ---
+    if data == "ip_list":
+        client_ips = get_all_client_ips()
+        if not client_ips:
+            await q.edit_message_text("Нет клиентов.")
+            await asyncio.sleep(1)
+            await show_menu(update, ctx)
+            return
+        lines = []
+        for name, ip, port in client_ips:
+            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
+        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
+        buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("ipchg:"):
+        name = data[6:]
+        ip, port = get_client_remote(name)
+        ctx.user_data["action"] = "change_ip"
+        ctx.user_data["change_ip_client"] = name
+        await q.edit_message_text(
+            f"<b>{name}</b>\n\n"
+            f"Текущий IP: <code>{ip or '—'}</code>\n"
+            f"Порт: <code>{port or '—'}</code>\n\n"
+            f"Введи новый IP адрес:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="ip_list")],
+            ])
+        )
+        return
 
     # --- Создать ---
     if data == "create":
@@ -914,6 +1021,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- Назад ---
     if data == "back":
+        ctx.user_data.pop("vpn_setup", None)
         ctx.user_data.pop("action", None)
         await show_menu(update, ctx, edit=True)
         return
@@ -936,11 +1044,43 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Отправить .ovpn": "send",
         "Бэкап": "backup",
         "Обновить бот": "update",
+        "📍 IP адреса": "ip_list",
     }
     if text in quick and action != "create_name":
         # Имитируем нажатие inline-кнопки
         ctx.user_data["quick_action"] = quick[text]
         await handle_quick(update, ctx, quick[text])
+        return
+
+    # Ввод нового IP для смены адреса фронта
+    if action == "change_ip":
+        ctx.user_data.pop("action", None)
+        client_name = ctx.user_data.pop("change_ip_client", None)
+        if not client_name:
+            await show_menu(update, ctx)
+            return
+        new_ip = text
+        # Валидация IP
+        parts = new_ip.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            ctx.user_data["action"] = "change_ip"
+            ctx.user_data["change_ip_client"] = client_name
+            await update.message.reply_text("❌ Неверный формат IP. Введи IPv4 (например 1.2.3.4):")
+            return
+        ok, msg_text = set_client_remote_ip(client_name, new_ip)
+        if ok:
+            await update.message.reply_text(f"✅ {msg_text}", parse_mode="HTML")
+            # Отправить обновлённый .ovpn файл
+            ovpn = os.path.join(OVPN_DIR, f"{client_name}.ovpn")
+            if os.path.exists(ovpn):
+                with open(ovpn, "rb") as f:
+                    await update.message.reply_document(
+                        document=InputFile(f, filename=f"{client_name}.ovpn"),
+                        caption=f"🔑 {client_name}.ovpn (новый IP: {new_ip})"
+                    )
+        else:
+            await update.message.reply_text(f"❌ {msg_text}", parse_mode="HTML")
+        await show_menu(update, ctx)
         return
 
     if action == "create_name":
