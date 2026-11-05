@@ -10,7 +10,6 @@
 #   bash setup.sh
 #   bash setup.sh TOKEN ADMIN_ID
 # ============================================================
-set -e
 
 echo "======================================"
 echo "  AlertMob — Setup"
@@ -19,9 +18,21 @@ echo ""
 
 # --- 1. Зависимости ---
 echo "[1/3] Устанавливаю зависимости..."
-apt update -qq
-apt install -y -qq python3 python3-pip curl git > /dev/null 2>&1
-pip install python-telegram-bot --break-system-packages -q 2>/dev/null || pip install python-telegram-bot -q
+apt update -qq || true
+apt install -y python3 python3-pip curl git -qq
+if [ $? -ne 0 ]; then
+    echo "  ❌ Ошибка установки пакетов"
+    exit 1
+fi
+
+pip install python-telegram-bot --break-system-packages -q 2>/dev/null \
+  || pip install python-telegram-bot -q 2>/dev/null \
+  || pip3 install python-telegram-bot --break-system-packages -q 2>/dev/null \
+  || pip3 install python-telegram-bot -q
+if [ $? -ne 0 ]; then
+    echo "  ❌ Ошибка установки python-telegram-bot"
+    exit 1
+fi
 echo "  ✓ Python + telegram-bot + git установлены"
 
 # --- 2. Скачать бота ---
@@ -30,6 +41,10 @@ if [ -d "/root/alertmob" ]; then
     cd /root/alertmob && git pull -q
 else
     git clone -q https://github.com/XSFORM/alertmob.git /root/alertmob
+fi
+if [ $? -ne 0 ]; then
+    echo "  ❌ Ошибка скачивания бота"
+    exit 1
 fi
 echo "  ✓ alertmob готов"
 
@@ -42,10 +57,9 @@ BOT_TOKEN="${1:-}"
 ADMIN_ID="${2:-}"
 
 # Если не переданы — спросить интерактивно через /dev/tty
-# (работает даже когда stdin занят пайпом от curl)
 if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
-    if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
-        echo "  ❌ Не могу спросить TOKEN/ID — stdin занят пайпом и /dev/tty недоступен."
+    if [ ! -e /dev/tty ]; then
+        echo "  ❌ Не могу спросить TOKEN/ID — /dev/tty недоступен."
         echo "  Используй: curl ... | bash -s -- TOKEN ADMIN_ID"
         exit 1
     fi
