@@ -13,6 +13,11 @@ import subprocess
 import sys
 import logging
 import html as html_escape
+import socket
+import base64
+import re
+
+import paramiko
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -275,8 +280,6 @@ def get_disabled_clients() -> set:
 
 # ======================== IP АДРЕСА (ФРОНТЫ) ========================
 
-import re
-
 
 def get_client_remote(name: str) -> tuple:
     """Прочитать remote IP и порт из .ovpn файла. → (ip, port) или (None, None)."""
@@ -337,6 +340,192 @@ def format_ip_table(client_ips: list) -> str:
     for name, ip, port in client_ips:
         lines.append(f"{name:<{max_name}}  {ip:>{max_ip}}:{port}")
     return "<b>📍 IP адреса клиентов</b>\n\n<pre>" + "\n".join(lines) + "</pre>"
+
+
+# ======================== ФРОНТ-СЕРВЕРЫ (SSH) ========================
+
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONT_SERVERS_FILE = os.path.join(BOT_DIR, "front_servers.json")
+SSH_TIMEOUT = 10
+SSH_CMD_TIMEOUT = 30
+
+# IP-мониторинг
+TM_PROBE_IP = "217.174.235.161"
+IP_FAIL_THRESHOLD = 3
+IP_CHECK_INTERVAL = 60  # секунд
+ip_fail_counts = {}  # {client_name: int}
+
+# GOST
+GOST_BIN = "/usr/local/bin/gost"
+GOST_SERVICE_PATH = "/usr/lib/systemd/system/gost.service"
+GOST_REPO = "ginuerzh/gost"
+
+
+def load_front_servers() -> dict:
+    """Загрузить данные фронт-серверов. {client_name: {ip, ssh_user, ssh_pass, label}}"""
+    if os.path.exists(FRONT_SERVERS_FILE):
+        try:
+            with open(FRONT_SERVERS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception):
+            pass
+    return {}
+
+
+def save_front_servers(data: dict):
+    tmp = FRONT_SERVERS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, FRONT_SERVERS_FILE)
+
+
+def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
+             cmd_timeout: int = None) -> tuple:
+    """Выполнить команду на удалённом сервере по SSH. → (success, output)"""
+    _timeout = cmd_timeout or SSH_CMD_TIMEOUT
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(ip, port=port, username=user, password=password,
+                       timeout=SSH_TIMEOUT, look_for_keys=False, allow_agent=False)
+        stdin, stdout, stderr = client.exec_command(command, timeout=_timeout)
+        stdout.channel.settimeout(_timeout)
+        try:
+            out = stdout.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            out = "(таймаут чтения)"
+        try:
+            err = stderr.read().decode("utf-8", errors="replace").strip()
+        except socket.timeout:
+            err = ""
+        result = out if out else err
+        return True, result if result else "(пустой вывод)"
+    except paramiko.AuthenticationException:
+        return False, "Ошибка авторизации (неверный логин/пароль)"
+    except paramiko.SSHException as e:
+        return False, f"SSH ошибка: {e}"
+    except socket.timeout:
+        return False, "Таймаут подключения"
+    except Exception as e:
+        return False, f"Ошибка: {e}"
+    finally:
+        client.close()
+
+
+def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
+    """SSH на host, пинг target. True = пинг прошёл."""
+    ok, out = ssh_exec(host, 22, user, password, f"ping -c 1 -W 3 {target}")
+    if ok and ("1 received" in out or "bytes from" in out):
+        return True
+    return False
+
+
+# ======================== GOST ФУНКЦИИ ========================
+
+
+def gost_install_script() -> str:
+    """Скрипт установки GOST на удалённый сервер."""
+    return (
+        "#!/bin/bash\n"
+        "apt-get update -qq && apt-get install -y -qq wget curl jq tar gzip > /dev/null 2>&1\n"
+        f"VER=$(curl -s 'https://api.github.com/repos/{GOST_REPO}/releases/latest' | jq -r '.tag_name' | sed 's/^v//')\n"
+        "ARCH=$(dpkg --print-architecture 2>/dev/null || echo amd64)\n"
+        '[ "$ARCH" = "arm64" ] && ARCH="armv8"\n'
+        '[ "$ARCH" = "armhf" ] && ARCH="armv7"\n'
+        "cd /tmp\n"
+        f"wget -q \"https://github.com/{GOST_REPO}/releases/download/v${{VER}}/gost_${{VER}}_linux_${{ARCH}}.tar.gz\" -O gost.tar.gz\n"
+        "tar -xzf gost.tar.gz && chmod +x gost && mv gost /usr/local/bin/gost\n"
+        "rm -f gost.tar.gz\n"
+        'echo "GOST_OK:$VER"\n'
+    )
+
+
+def gost_build_service(rules: list) -> str:
+    """Сгенерировать systemd unit для GOST с правилами."""
+    gost_ls = " ".join(
+        f"-L={r['proto']}://:{r['local_port']}/{r['remote_ip']}:{r['remote_port']}"
+        for r in rules
+    )
+    return (
+        "[Unit]\\n"
+        "Description=GO Simple Tunnel\\n"
+        "After=network.target\\n"
+        "Wants=network.target\\n"
+        "\\n"
+        "[Service]\\n"
+        "Type=simple\\n"
+        f"ExecStart={GOST_BIN} {gost_ls}\\n"
+        "Restart=on-failure\\n"
+        "\\n"
+        "[Install]\\n"
+        "WantedBy=multi-user.target"
+    )
+
+
+# ======================== IP МОНИТОР (ФОНОВЫЙ) ========================
+
+
+async def ip_block_monitor(app):
+    """Фоновая задача: каждые 60 сек проверяет IP каждого ключа через SSH-пинг.
+    Если 3 раза подряд пинг не проходит — IP заблокирован, шлём уведомление."""
+    global ip_fail_counts
+    while True:
+        try:
+            await asyncio.sleep(IP_CHECK_INTERVAL)
+            fronts = load_front_servers()
+            if not fronts:
+                continue
+
+            for client_name, srv in fronts.items():
+                front_ip = srv.get("ip")
+                if not front_ip or not srv.get("ssh_user") or not srv.get("ssh_pass"):
+                    continue
+
+                try:
+                    ok = await asyncio.to_thread(
+                        ping_via_ssh, front_ip,
+                        srv["ssh_user"], srv["ssh_pass"],
+                        TM_PROBE_IP
+                    )
+                except Exception as e:
+                    log.error(f"[ip_monitor] SSH error for {client_name} ({front_ip}): {e}")
+                    ok = False
+
+                if ok:
+                    if ip_fail_counts.get(client_name, 0) > 0:
+                        log.info(f"[ip_monitor] {client_name} ({front_ip}) — пинг ОК, сброс счётчика")
+                    ip_fail_counts[client_name] = 0
+                    continue
+
+                ip_fail_counts[client_name] = ip_fail_counts.get(client_name, 0) + 1
+                count = ip_fail_counts[client_name]
+                log.warning(f"[ip_monitor] {client_name} ({front_ip}) — FAIL #{count}/{IP_FAIL_THRESHOLD}")
+
+                if count >= IP_FAIL_THRESHOLD:
+                    # IP заблокирован — отправить уведомление
+                    ip_fail_counts[client_name] = 0  # сбросить, чтобы не спамить
+                    try:
+                        await app.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(
+                                f"🚫 <b>IP ЗАБЛОКИРОВАН</b>\n\n"
+                                f"Клиент: <b>{client_name}</b>\n"
+                                f"IP фронта: <code>{front_ip}</code>\n"
+                                f"Пинг {TM_PROBE_IP} не прошёл {IP_FAIL_THRESHOLD} раз подряд.\n\n"
+                                f"Нужна смена IP!"
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        log.error(f"[ip_monitor] Не удалось отправить уведомление: {e}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"[ip_monitor] loop error: {e}")
+            await asyncio.sleep(10)
 
 
 # ======================== БЭКАП / ВОССТАНОВЛЕНИЕ ========================
@@ -565,8 +754,8 @@ BOTTOM_KB = ReplyKeyboardMarkup(
         [KeyboardButton("Создать"), KeyboardButton("Удалить")],
         [KeyboardButton("Вкл/Выкл"), KeyboardButton("Мониторинг")],
         [KeyboardButton("Список"), KeyboardButton("Отправить .ovpn")],
-        [KeyboardButton("📍 IP адреса"), KeyboardButton("Бэкап")],
-        [KeyboardButton("Обновить бот")],
+        [KeyboardButton("📍 IP адреса"), KeyboardButton("🔒 GOST")],
+        [KeyboardButton("Бэкап"), KeyboardButton("Обновить бот")],
     ],
     resize_keyboard=True
 )
@@ -673,6 +862,24 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
         await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
+    if action == "gost_menu":
+        fronts = load_front_servers()
+        text = f"<b>🔒 GOST / Фронты</b>\n\nФронт-серверов: {len(fronts)}"
+        if fronts:
+            lines = []
+            for cname, srv in fronts.items():
+                lines.append(f"  <code>{srv.get('ip', '?')}</code> — {cname}")
+            text += "\n\n" + "\n".join(lines)
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить фронт", callback_data="front_add")],
+            [InlineKeyboardButton("📋 Список фронтов", callback_data="front_list")],
+            [InlineKeyboardButton("⬇️ Установить GOST", callback_data="gost_install_select")],
+            [InlineKeyboardButton("⚙️ Настроить правила GOST", callback_data="gost_rules_select")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
+        ]
+        await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
     if action == "backup":
         buttons = [
             [InlineKeyboardButton("Создать бэкап", callback_data="backup_create")],
@@ -729,6 +936,7 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
         ])
         buttons.append([
             InlineKeyboardButton("📍 IP адреса", callback_data="ip_list"),
+            InlineKeyboardButton("🔒 GOST", callback_data="gost_menu"),
         ])
         buttons.append([
             InlineKeyboardButton("Мониторинг", callback_data="monitor"),
@@ -993,6 +1201,338 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
+    # --- GOST / Фронт-серверы ---
+    if data == "gost_menu":
+        fronts = load_front_servers()
+        text = f"<b>🔒 GOST / Фронты</b>\n\nФронт-серверов: {len(fronts)}"
+        if fronts:
+            lines = []
+            for cname, srv in fronts.items():
+                lines.append(f"  <code>{srv.get('ip', '?')}</code> — {cname}")
+            text += "\n\n" + "\n".join(lines)
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить фронт", callback_data="front_add")],
+            [InlineKeyboardButton("📋 Список фронтов", callback_data="front_list")],
+            [InlineKeyboardButton("⬇️ Установить GOST", callback_data="gost_install_select")],
+            [InlineKeyboardButton("⚙️ Настроить правила GOST", callback_data="gost_rules_select")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data == "front_add":
+        clients = list_clients()
+        fronts = load_front_servers()
+        # Показать только клиентов без привязанного фронта
+        available = [c for c in clients if c not in fronts]
+        if not available:
+            await q.edit_message_text(
+                "Все клиенты уже имеют привязанный фронт-сервер.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="gost_menu")]])
+            )
+            return
+        buttons = [[InlineKeyboardButton(c, callback_data=f"front_add_client:{c}")] for c in available]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="gost_menu")])
+        await q.edit_message_text(
+            "Выбери клиента для привязки фронт-сервера:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data.startswith("front_add_client:"):
+        client_name = data[17:]
+        ctx.user_data["action"] = "front_add_ip"
+        ctx.user_data["front_client"] = client_name
+        await q.edit_message_text(
+            f"<b>Добавление фронта для {client_name}</b>\n\n"
+            "Введи IP адрес фронт-сервера:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="gost_menu")]])
+        )
+        return
+
+    if data == "front_list":
+        fronts = load_front_servers()
+        if not fronts:
+            await q.edit_message_text(
+                "Нет фронт-серверов.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="gost_menu")]])
+            )
+            return
+        buttons = [[InlineKeyboardButton(f"{cname} ({srv.get('ip', '?')})", callback_data=f"front_detail:{cname}")]
+                    for cname, srv in fronts.items()]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="gost_menu")])
+        await q.edit_message_text("Выбери фронт-сервер:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("front_detail:"):
+        cname = data[13:]
+        fronts = load_front_servers()
+        srv = fronts.get(cname)
+        if not srv:
+            await q.edit_message_text("Фронт не найден.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="front_list")]]))
+            return
+        rules_text = ""
+        if srv.get("gost_rules"):
+            rules_text = "\n\n<b>GOST правила:</b>\n" + "\n".join(
+                f"  <code>{r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}</code>"
+                for r in srv["gost_rules"]
+            )
+        text = (
+            f"<b>Фронт: {cname}</b>\n\n"
+            f"IP: <code>{srv.get('ip', '?')}</code>\n"
+            f"SSH: <code>{srv.get('ssh_user', '?')}</code>\n"
+            f"Пароль: <code>{'*' * len(srv.get('ssh_pass', ''))}</code>"
+            f"{rules_text}"
+        )
+        buttons = [
+            [InlineKeyboardButton("🔍 Проверить пинг", callback_data=f"front_ping:{cname}")],
+            [InlineKeyboardButton("⬇️ Установить GOST", callback_data=f"gost_install:{cname}")],
+            [InlineKeyboardButton("⚙️ Правила GOST", callback_data=f"gost_rules:{cname}")],
+            [InlineKeyboardButton("❌ Удалить фронт", callback_data=f"front_del:{cname}")],
+            [InlineKeyboardButton("Назад", callback_data="front_list")],
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("front_ping:"):
+        cname = data[11:]
+        fronts = load_front_servers()
+        srv = fronts.get(cname)
+        if not srv:
+            await q.edit_message_text("Фронт не найден.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="front_list")]]))
+            return
+        await q.edit_message_text(f"🔍 Проверяю пинг {srv['ip']}...")
+        try:
+            ok = await asyncio.to_thread(
+                ping_via_ssh, srv["ip"], srv["ssh_user"], srv["ssh_pass"], TM_PROBE_IP
+            )
+        except Exception as e:
+            ok = False
+        if ok:
+            result = f"✅ Пинг <code>{srv['ip']}</code> → {TM_PROBE_IP} — <b>ОК</b>"
+        else:
+            result = f"❌ Пинг <code>{srv['ip']}</code> → {TM_PROBE_IP} — <b>НЕТ ОТВЕТА</b>"
+        await q.message.reply_text(result, parse_mode="HTML")
+        # Вернуть детали фронта
+        rules_text = ""
+        if srv.get("gost_rules"):
+            rules_text = "\n\n<b>GOST правила:</b>\n" + "\n".join(
+                f"  <code>{r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}</code>"
+                for r in srv["gost_rules"]
+            )
+        text = (
+            f"<b>Фронт: {cname}</b>\n\n"
+            f"IP: <code>{srv.get('ip', '?')}</code>\n"
+            f"SSH: <code>{srv.get('ssh_user', '?')}</code>"
+            f"{rules_text}"
+        )
+        buttons = [
+            [InlineKeyboardButton("🔍 Проверить пинг", callback_data=f"front_ping:{cname}")],
+            [InlineKeyboardButton("⬇️ Установить GOST", callback_data=f"gost_install:{cname}")],
+            [InlineKeyboardButton("⚙️ Правила GOST", callback_data=f"gost_rules:{cname}")],
+            [InlineKeyboardButton("❌ Удалить фронт", callback_data=f"front_del:{cname}")],
+            [InlineKeyboardButton("Назад", callback_data="front_list")],
+        ]
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("front_del:"):
+        cname = data[10:]
+        fronts = load_front_servers()
+        if cname in fronts:
+            del fronts[cname]
+            save_front_servers(fronts)
+            await q.edit_message_text(f"✅ Фронт <b>{cname}</b> удалён.", parse_mode="HTML")
+        else:
+            await q.edit_message_text("Фронт не найден.")
+        await asyncio.sleep(1)
+        # Вернуться в gost_menu
+        fronts = load_front_servers()
+        text = f"<b>🔒 GOST / Фронты</b>\n\nФронт-серверов: {len(fronts)}"
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить фронт", callback_data="front_add")],
+            [InlineKeyboardButton("📋 Список фронтов", callback_data="front_list")],
+            [InlineKeyboardButton("Назад", callback_data="back")],
+        ]
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    # --- GOST установка ---
+    if data == "gost_install_select":
+        fronts = load_front_servers()
+        if not fronts:
+            await q.edit_message_text("Сначала добавь фронт-серверы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="gost_menu")]]))
+            return
+        buttons = [[InlineKeyboardButton(f"{cname} ({srv.get('ip', '?')})", callback_data=f"gost_install:{cname}")]
+                    for cname, srv in fronts.items()]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="gost_menu")])
+        await q.edit_message_text("Выбери сервер для установки GOST:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("gost_install:"):
+        cname = data[13:]
+        fronts = load_front_servers()
+        srv = fronts.get(cname)
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=f"front_detail:{cname}")]])
+        if not srv:
+            await q.edit_message_text("Фронт не найден.", reply_markup=back_kb)
+            return
+        ip = srv["ip"]
+        await q.edit_message_text(f"⏳ Устанавливаю GOST на <code>{ip}</code>...", parse_mode="HTML")
+        script = gost_install_script()
+        b64 = base64.b64encode(script.encode()).decode()
+        start_cmd = (
+            f"echo '{b64}' | base64 -d > /tmp/gost_install.sh && "
+            "chmod +x /tmp/gost_install.sh && "
+            "rm -f /tmp/gost_install.log && "
+            "nohup bash /tmp/gost_install.sh > /tmp/gost_install.log 2>&1 & "
+            "echo BG_OK"
+        )
+        ok, out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd)
+        if not ok or "BG_OK" not in out:
+            await q.message.reply_text(
+                f"❌ Не удалось запустить установку на {ip}:\n<pre>{html_escape.escape(out[:2000])}</pre>",
+                parse_mode="HTML", reply_markup=back_kb)
+            return
+        check_cmd = (
+            "cat /tmp/gost_install.log 2>/dev/null; "
+            "pgrep -f gost_install.sh > /dev/null 2>&1 && echo __RUNNING__ || echo __FINISHED__"
+        )
+        for attempt in range(30):
+            await asyncio.sleep(10)
+            elapsed = (attempt + 1) * 10
+            ok2, log_out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], check_cmd)
+            if "GOST_OK:" in log_out:
+                ver = log_out.split("GOST_OK:")[-1].split("\n")[0].split("__")[0].strip()
+                await q.message.reply_text(
+                    f"✅ GOST v{ver} установлен на <code>{ip}</code> ({elapsed} сек)",
+                    parse_mode="HTML", reply_markup=back_kb)
+                return
+            if "__FINISHED__" in log_out and "GOST_OK:" not in log_out:
+                clean = log_out.replace("__FINISHED__", "").replace("__RUNNING__", "").strip()
+                await q.message.reply_text(
+                    f"❌ Ошибка установки на {ip}:\n<pre>{html_escape.escape(clean[:2000])}</pre>",
+                    parse_mode="HTML", reply_markup=back_kb)
+                return
+            bars = "▓" * (attempt % 4 + 1) + "░" * (3 - attempt % 4)
+            try:
+                await q.edit_message_text(
+                    f"⏳ Устанавливаю GOST на <code>{ip}</code>... {bars} ({elapsed} сек)",
+                    parse_mode="HTML")
+            except Exception:
+                pass
+        await q.message.reply_text(
+            f"⏳ Установка на <code>{ip}</code> идёт дольше 5 мин.\nGOST может установиться позже.",
+            parse_mode="HTML", reply_markup=back_kb)
+        return
+
+    # --- GOST правила ---
+    if data == "gost_rules_select":
+        fronts = load_front_servers()
+        if not fronts:
+            await q.edit_message_text("Сначала добавь фронт-серверы.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="gost_menu")]]))
+            return
+        buttons = [[InlineKeyboardButton(f"{cname} ({srv.get('ip', '?')})", callback_data=f"gost_rules:{cname}")]
+                    for cname, srv in fronts.items()]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="gost_menu")])
+        await q.edit_message_text("Выбери сервер для настройки правил:", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+
+    if data.startswith("gost_rules:"):
+        cname = data[11:]
+        fronts = load_front_servers()
+        srv = fronts.get(cname)
+        if not srv:
+            await q.edit_message_text("Фронт не найден.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="gost_menu")]]))
+            return
+        rules = srv.get("gost_rules", [])
+        if rules:
+            text = f"<b>Правила GOST для {cname}</b> (<code>{srv['ip']}</code>)\n\n"
+            text += "\n".join(
+                f"  {i+1}. <code>{r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}</code>"
+                for i, r in enumerate(rules)
+            )
+        else:
+            text = f"<b>Правила GOST для {cname}</b>\n\nНет правил."
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить правило", callback_data=f"gost_addrule:{cname}")],
+        ]
+        if rules:
+            buttons.append([InlineKeyboardButton("🔄 Применить на сервер", callback_data=f"gost_apply:{cname}")])
+            buttons.append([InlineKeyboardButton("🗑 Очистить правила", callback_data=f"gost_clearrules:{cname}")])
+        buttons.append([InlineKeyboardButton("Назад", callback_data=f"front_detail:{cname}")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("gost_addrule:"):
+        cname = data[13:]
+        ctx.user_data["action"] = "gost_rule_proto"
+        ctx.user_data["gost_rule_client"] = cname
+        await q.edit_message_text(
+            f"<b>Новое правило для {cname}</b>\n\n"
+            "Протоколы: tcp, udp, relay, socks5\n\n"
+            "Введи протокол (например <code>tcp</code>):",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data=f"gost_rules:{cname}")]])
+        )
+        return
+
+    if data.startswith("gost_clearrules:"):
+        cname = data[16:]
+        fronts = load_front_servers()
+        if cname in fronts:
+            fronts[cname]["gost_rules"] = []
+            save_front_servers(fronts)
+        await q.edit_message_text(f"✅ Правила для {cname} очищены.", parse_mode="HTML")
+        await asyncio.sleep(1)
+        # Вернуть в gost_rules
+        fronts = load_front_servers()
+        srv = fronts.get(cname, {})
+        text = f"<b>Правила GOST для {cname}</b>\n\nНет правил."
+        buttons = [
+            [InlineKeyboardButton("➕ Добавить правило", callback_data=f"gost_addrule:{cname}")],
+            [InlineKeyboardButton("Назад", callback_data=f"front_detail:{cname}")],
+        ]
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("gost_apply:"):
+        cname = data[11:]
+        fronts = load_front_servers()
+        srv = fronts.get(cname)
+        if not srv or not srv.get("gost_rules"):
+            await q.edit_message_text("Нет правил для применения.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=f"gost_rules:{cname}")]]))
+            return
+        ip = srv["ip"]
+        rules = srv["gost_rules"]
+        await q.edit_message_text(f"⏳ Применяю {len(rules)} правил на <code>{ip}</code>...", parse_mode="HTML")
+        service_content = gost_build_service(rules)
+        cmd = (
+            f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
+            "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
+        )
+        ok, out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=f"gost_rules:{cname}")]])
+        if ok and "GOST_CONF_OK" in out:
+            rules_txt = "\n".join(
+                f"  <code>{r['proto']}://:{r['local_port']} → {r['remote_ip']}:{r['remote_port']}</code>"
+                for r in rules)
+            await q.message.reply_text(
+                f"✅ GOST настроен на <code>{ip}</code>:\n{rules_txt}",
+                parse_mode="HTML", reply_markup=back_kb)
+        else:
+            await q.message.reply_text(
+                f"❌ Ошибка:\n<pre>{html_escape.escape(out[:2000])}</pre>",
+                parse_mode="HTML", reply_markup=back_kb)
+        return
+
     # --- IP адреса (фронты) ---
     if data == "ip_list":
         client_ips = get_all_client_ips()
@@ -1049,11 +1589,138 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Бэкап": "backup",
         "Обновить бот": "update",
         "📍 IP адреса": "ip_list",
+        "🔒 GOST": "gost_menu",
     }
     if text in quick and action != "create_name":
         # Имитируем нажатие inline-кнопки
         ctx.user_data["quick_action"] = quick[text]
         await handle_quick(update, ctx, quick[text])
+        return
+
+    # --- Добавление фронт-сервера (пошаговый ввод) ---
+    if action == "front_add_ip":
+        ctx.user_data.pop("action", None)
+        client_name = ctx.user_data.get("front_client")
+        parts = text.split(".")
+        if len(parts) != 4 or not all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            ctx.user_data["action"] = "front_add_ip"
+            await update.message.reply_text("❌ Неверный IP. Введи IPv4 (например 1.2.3.4):")
+            return
+        ctx.user_data["front_ip"] = text
+        ctx.user_data["action"] = "front_add_user"
+        await update.message.reply_text(f"IP: <code>{text}</code>\n\nВведи SSH логин:", parse_mode="HTML")
+        return
+
+    if action == "front_add_user":
+        ctx.user_data.pop("action", None)
+        ctx.user_data["front_ssh_user"] = text
+        ctx.user_data["action"] = "front_add_pass"
+        await update.message.reply_text("Введи SSH пароль:")
+        return
+
+    if action == "front_add_pass":
+        ctx.user_data.pop("action", None)
+        client_name = ctx.user_data.pop("front_client", None)
+        front_ip = ctx.user_data.pop("front_ip", None)
+        ssh_user = ctx.user_data.pop("front_ssh_user", None)
+        ssh_pass = text
+        if not client_name or not front_ip:
+            await show_menu(update, ctx)
+            return
+        # Проверить SSH подключение
+        await update.message.reply_text(f"Проверяю SSH {ssh_user}@{front_ip}...")
+        ok, out = await asyncio.to_thread(ssh_exec, front_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
+        if ok and "SSH_OK" in out:
+            fronts = load_front_servers()
+            fronts[client_name] = {
+                "ip": front_ip,
+                "ssh_user": ssh_user,
+                "ssh_pass": ssh_pass,
+                "gost_rules": [],
+            }
+            save_front_servers(fronts)
+            await update.message.reply_text(
+                f"✅ Фронт-сервер добавлен:\n\n"
+                f"Клиент: <b>{client_name}</b>\n"
+                f"IP: <code>{front_ip}</code>\n"
+                f"SSH: <code>{ssh_user}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ SSH не удался:\n<pre>{html_escape.escape(out[:500])}</pre>\n\n"
+                f"Фронт НЕ добавлен. Попробуй снова.",
+                parse_mode="HTML"
+            )
+        await show_menu(update, ctx)
+        return
+
+    # --- GOST правила (пошаговый ввод) ---
+    if action == "gost_rule_proto":
+        ctx.user_data.pop("action", None)
+        proto = text.lower().strip()
+        valid_protos = ["tcp", "udp", "relay", "socks5", "http", "tls", "ws"]
+        if proto not in valid_protos:
+            ctx.user_data["action"] = "gost_rule_proto"
+            await update.message.reply_text(f"❌ Неверный протокол. Доступны: {', '.join(valid_protos)}")
+            return
+        ctx.user_data["gost_rule_proto"] = proto
+        ctx.user_data["action"] = "gost_rule_local_port"
+        await update.message.reply_text(f"Протокол: <code>{proto}</code>\n\nВведи локальный порт:", parse_mode="HTML")
+        return
+
+    if action == "gost_rule_local_port":
+        ctx.user_data.pop("action", None)
+        if not text.isdigit() or not (1 <= int(text) <= 65535):
+            ctx.user_data["action"] = "gost_rule_local_port"
+            await update.message.reply_text("❌ Порт: число 1-65535")
+            return
+        ctx.user_data["gost_rule_local_port"] = text
+        ctx.user_data["action"] = "gost_rule_remote"
+        await update.message.reply_text(
+            f"Локальный порт: <code>{text}</code>\n\n"
+            "Введи удалённый адрес и порт (формат: <code>IP:PORT</code>):",
+            parse_mode="HTML"
+        )
+        return
+
+    if action == "gost_rule_remote":
+        ctx.user_data.pop("action", None)
+        if ":" not in text:
+            ctx.user_data["action"] = "gost_rule_remote"
+            await update.message.reply_text("❌ Формат: IP:PORT (например 10.8.0.1:443)")
+            return
+        remote_ip, remote_port = text.rsplit(":", 1)
+        if not remote_port.isdigit() or not (1 <= int(remote_port) <= 65535):
+            ctx.user_data["action"] = "gost_rule_remote"
+            await update.message.reply_text("❌ Порт: число 1-65535")
+            return
+        cname = ctx.user_data.pop("gost_rule_client", None)
+        proto = ctx.user_data.pop("gost_rule_proto", "tcp")
+        local_port = ctx.user_data.pop("gost_rule_local_port", "0")
+        if not cname:
+            await show_menu(update, ctx)
+            return
+        rule = {
+            "proto": proto,
+            "local_port": local_port,
+            "remote_ip": remote_ip,
+            "remote_port": remote_port,
+        }
+        fronts = load_front_servers()
+        if cname in fronts:
+            if "gost_rules" not in fronts[cname]:
+                fronts[cname]["gost_rules"] = []
+            fronts[cname]["gost_rules"].append(rule)
+            save_front_servers(fronts)
+            await update.message.reply_text(
+                f"✅ Правило добавлено:\n"
+                f"<code>{proto}://:{local_port} → {remote_ip}:{remote_port}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text("❌ Фронт не найден.")
+        await show_menu(update, ctx)
         return
 
     # Ввод нового IP для смены адреса фронта
@@ -1143,6 +1810,11 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
+    # Запустить фоновый мониторинг IP после старта бота
+    async def post_init(application):
+        application.create_task(ip_block_monitor(application))
+
+    app.post_init = post_init
     app.run_polling(drop_pending_updates=True)
 
 
