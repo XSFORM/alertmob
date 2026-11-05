@@ -701,7 +701,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "IPV6_SUPPORT": "n",
                 "PORT_CHOICE": "1",
                 "PROTOCOL_CHOICE": "1",
-                "DNS": "3",
+                "DNS": "google",
                 "COMPRESSION_ENABLED": "n",
                 "CUSTOMIZE_ENC": "y",
                 "CIPHER_CHOICE": "1",
