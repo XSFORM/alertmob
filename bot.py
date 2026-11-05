@@ -635,14 +635,12 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
     if installed:
         status = f"OpenVPN: работает\nКлиентов: {len(clients)}"
     else:
-        status = "OpenVPN: не установлен"
+        status = "OpenVPN: не установлен\n\nУстановите OpenVPN вручную перед использованием бота."
 
     text = f"<b>AlertMob VPN</b>\n\n{status}"
 
     buttons = []
-    if not installed:
-        buttons.append([InlineKeyboardButton("Установить OpenVPN", callback_data="install")])
-    else:
+    if installed:
         buttons.append([
             InlineKeyboardButton("Создать", callback_data="create"),
             InlineKeyboardButton("Удалить", callback_data="delete"),
@@ -674,227 +672,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-
-    # --- Установка (пошаговый мастер) ---
-    if data == "install":
-        ip = get_public_ip()
-        ctx.user_data["vpn_setup"] = {"endpoint": ip}
-        await q.edit_message_text(
-            f"<b>Установка OpenVPN</b>\n\n"
-            f"IP сервера: <code>{ip}</code>\n\n"
-            f"Выбери протокол:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("UDP (рекомендуется)", callback_data="vs:protocol:udp")],
-                [InlineKeyboardButton("TCP", callback_data="vs:protocol:tcp")],
-                [InlineKeyboardButton("Отмена", callback_data="back")],
-            ])
-        )
-        return
-
-    if data.startswith("vs:"):
-        setup = ctx.user_data.get("vpn_setup")
-        if not setup:
-            await show_menu(update, ctx, edit=True)
-            return
-        parts = data.split(":", 2)
-        step = parts[1]
-        val = parts[2] if len(parts) > 2 else ""
-
-        # --- Шаг 1: протокол → порт ---
-        if step == "protocol":
-            setup["protocol"] = val
-            await q.edit_message_text(
-                f"Протокол: <b>{val.upper()}</b>\n\nВыбери порт:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("1194 (стандарт)", callback_data="vs:port:1194")],
-                    [InlineKeyboardButton("443 (обход блокировок)", callback_data="vs:port:443")],
-                    [InlineKeyboardButton("Случайный", callback_data="vs:port:random")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 2: порт → DNS ---
-        if step == "port":
-            setup["port"] = val
-            port_label = "случайный" if val == "random" else val
-            await q.edit_message_text(
-                f"Порт: <b>{port_label}</b>\n\nВыбери DNS:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("Cloudflare", callback_data="vs:dns:cloudflare"),
-                        InlineKeyboardButton("Google", callback_data="vs:dns:google"),
-                    ],
-                    [
-                        InlineKeyboardButton("Quad9", callback_data="vs:dns:quad9"),
-                        InlineKeyboardButton("OpenDNS", callback_data="vs:dns:opendns"),
-                    ],
-                    [
-                        InlineKeyboardButton("AdGuard", callback_data="vs:dns:adguard"),
-                        InlineKeyboardButton("Системный", callback_data="vs:dns:system"),
-                    ],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 3: DNS → шифр ---
-        if step == "dns":
-            setup["dns"] = val
-            await q.edit_message_text(
-                f"DNS: <b>{val}</b>\n\nВыбери шифрование:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("AES-128-GCM (быстрый)", callback_data="vs:cipher:AES-128-GCM")],
-                    [InlineKeyboardButton("AES-256-GCM (надёжный)", callback_data="vs:cipher:AES-256-GCM")],
-                    [InlineKeyboardButton("CHACHA20-POLY1305", callback_data="vs:cipher:CHACHA20-POLY1305")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 4: шифр → тип сертификата ---
-        if step == "cipher":
-            setup["cipher"] = val
-            await q.edit_message_text(
-                f"Шифр: <b>{val}</b>\n\nТип сертификата:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("ECDSA (быстрый, современный)", callback_data="vs:cert:ecdsa")],
-                    [InlineKeyboardButton("RSA (совместимый)", callback_data="vs:cert:rsa")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 5: сертификат → TLS защита ---
-        if step == "cert":
-            setup["cert_type"] = val
-            await q.edit_message_text(
-                f"Сертификат: <b>{val.upper()}</b>\n\nЗащита TLS канала:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("tls-crypt-v2 (максимум)", callback_data="vs:tls:crypt-v2")],
-                    [InlineKeyboardButton("tls-crypt", callback_data="vs:tls:crypt")],
-                    [InlineKeyboardButton("tls-auth", callback_data="vs:tls:auth")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 6: TLS → имя клиента ---
-        if step == "tls":
-            setup["tls_sig"] = val
-            ctx.user_data["action"] = "vpn_client_name"
-            await q.edit_message_text(
-                f"TLS: <b>{val}</b>\n\n"
-                f"Введи имя первого клиента (латиница, без пробелов).\n"
-                f"Или нажми кнопку для стандартного имени:",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("first-client", callback_data="vs:client:first-client")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 7: имя клиента → подтверждение ---
-        if step == "client":
-            setup["client"] = val
-            ctx.user_data.pop("action", None)
-            summary = (
-                f"<b>Параметры установки:</b>\n\n"
-                f"IP: <code>{setup['endpoint']}</code>\n"
-                f"Протокол: <b>{setup['protocol'].upper()}</b>\n"
-                f"Порт: <b>{'случайный' if setup['port'] == 'random' else setup['port']}</b>\n"
-                f"DNS: <b>{setup['dns']}</b>\n"
-                f"Шифр: <b>{setup['cipher']}</b>\n"
-                f"Сертификат: <b>{setup['cert_type'].upper()}</b>\n"
-                f"TLS: <b>{setup['tls_sig']}</b>\n"
-                f"Клиент: <b>{setup['client']}</b>\n\n"
-                f"Начать установку?"
-            )
-            await q.edit_message_text(
-                summary,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Установить", callback_data="vs:confirm:yes")],
-                    [InlineKeyboardButton("Отмена", callback_data="back")],
-                ])
-            )
-            return
-
-        # --- Шаг 8: подтверждение → установка ---
-        if step == "confirm" and val == "yes":
-            await q.edit_message_text("Скачиваю скрипт и запускаю установку...\nЭто займёт 1-3 минуты.")
-
-            try:
-                # Скачать скрипт
-                subprocess.run(
-                    ["curl", "-sSL", "-o", INSTALL_SCRIPT,
-                     "https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh"],
-                    capture_output=True, timeout=30
-                )
-                os.chmod(INSTALL_SCRIPT, 0o755)
-
-                # Собрать аргументы из выбранных параметров
-                cmd = ["bash", INSTALL_SCRIPT, "install"]
-                cmd += ["--endpoint", setup["endpoint"]]
-                cmd += ["--protocol", setup["protocol"]]
-                if setup["port"] == "random":
-                    cmd += ["--port-random"]
-                else:
-                    cmd += ["--port", setup["port"]]
-                cmd += ["--dns", setup["dns"]]
-                cmd += ["--cipher", setup["cipher"]]
-                cmd += ["--cert-type", setup["cert_type"]]
-                cmd += ["--tls-sig", setup["tls_sig"]]
-                cmd += ["--hmac", "SHA256"]
-                cmd += ["--client", setup["client"]]
-
-                log.info("OpenVPN install cmd: %s", " ".join(cmd))
-
-                r = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=300
-                )
-
-                if openvpn_installed():
-                    port_label = "случайный" if setup["port"] == "random" else setup["port"]
-                    await q.message.reply_text(
-                        f"OpenVPN установлен!\n\n"
-                        f"IP: <code>{setup['endpoint']}</code>\n"
-                        f"Протокол: {setup['protocol'].upper()}\n"
-                        f"Порт: {port_label}\n"
-                        f"DNS: {setup['dns']}\n"
-                        f"Шифр: {setup['cipher']}\n"
-                        f"TLS: {setup['tls_sig']}\n\n"
-                        f"Первый клиент: <b>{setup['client']}</b>",
-                        parse_mode="HTML"
-                    )
-                    ovpn = os.path.join(OVPN_DIR, f"{setup['client']}.ovpn")
-                    if os.path.exists(ovpn):
-                        with open(ovpn, "rb") as f:
-                            await q.message.reply_document(
-                                document=InputFile(f, filename=f"{setup['client']}.ovpn"),
-                                caption=f"{setup['client']}.ovpn"
-                            )
-                else:
-                    err = (r.stderr or r.stdout or "нет вывода")[-800:]
-                    await q.message.reply_text(
-                        f"Ошибка установки:\n<pre>{html_escape.escape(err)}</pre>",
-                        parse_mode="HTML"
-                    )
-            except subprocess.TimeoutExpired:
-                await q.message.reply_text("Таймаут установки (>5 мин)")
-            except Exception as e:
-                await q.message.reply_text(f"Ошибка: {e}")
-
-            ctx.user_data.pop("vpn_setup", None)
-            await show_menu(update, ctx)
-            return
 
     # --- Создать ---
     if data == "create":
@@ -1137,7 +914,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- Назад ---
     if data == "back":
-        ctx.user_data.pop("vpn_setup", None)
         ctx.user_data.pop("action", None)
         await show_menu(update, ctx, edit=True)
         return
@@ -1165,45 +941,6 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Имитируем нажатие inline-кнопки
         ctx.user_data["quick_action"] = quick[text]
         await handle_quick(update, ctx, quick[text])
-        return
-
-    # Ввод имени клиента при установке OpenVPN
-    if action == "vpn_client_name":
-        ctx.user_data.pop("action", None)
-        name = text.replace(" ", "_")
-        if not name or not name.isascii() or not name.replace("_", "").replace("-", "").isalnum():
-            await update.message.reply_text("Имя: только латиница, цифры, дефис, подчёркивание.")
-            ctx.user_data["action"] = "vpn_client_name"
-            return
-        if len(name) > 32:
-            await update.message.reply_text("Макс 32 символа.")
-            ctx.user_data["action"] = "vpn_client_name"
-            return
-        setup = ctx.user_data.get("vpn_setup")
-        if not setup:
-            await show_menu(update, ctx)
-            return
-        setup["client"] = name
-        summary = (
-            f"<b>Параметры установки:</b>\n\n"
-            f"IP: <code>{setup['endpoint']}</code>\n"
-            f"Протокол: <b>{setup['protocol'].upper()}</b>\n"
-            f"Порт: <b>{'случайный' if setup['port'] == 'random' else setup['port']}</b>\n"
-            f"DNS: <b>{setup['dns']}</b>\n"
-            f"Шифр: <b>{setup['cipher']}</b>\n"
-            f"Сертификат: <b>{setup['cert_type'].upper()}</b>\n"
-            f"TLS: <b>{setup['tls_sig']}</b>\n"
-            f"Клиент: <b>{name}</b>\n\n"
-            f"Начать установку?"
-        )
-        await update.message.reply_text(
-            summary,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Установить", callback_data="vs:confirm:yes")],
-                [InlineKeyboardButton("Отмена", callback_data="back")],
-            ])
-        )
         return
 
     if action == "create_name":
