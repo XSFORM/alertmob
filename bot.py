@@ -277,6 +277,7 @@ def get_disabled_clients() -> set:
 
 import re
 
+
 def get_client_remote(name: str) -> tuple:
     """Прочитать remote IP и порт из .ovpn файла. → (ip, port) или (None, None)."""
     ovpn = os.path.join(OVPN_DIR, f"{name}.ovpn")
@@ -703,14 +704,12 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=False):
     if installed:
         status = f"OpenVPN: работает\nКлиентов: {len(clients)}"
     else:
-        status = "OpenVPN: не установлен"
+        status = "OpenVPN: не установлен\n\nУстановите OpenVPN вручную перед использованием бота."
 
     text = f"<b>AlertMob VPN</b>\n\n{status}"
 
     buttons = []
-    if not installed:
-        buttons.append([InlineKeyboardButton("OpenVPN не установлен", callback_data="back")])
-    else:
+    if installed:
         buttons.append([
             InlineKeyboardButton("Создать", callback_data="create"),
             InlineKeyboardButton("Удалить", callback_data="delete"),
@@ -745,40 +744,6 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-
-    # --- IP адреса (фронты) ---
-    if data == "ip_list":
-        client_ips = get_all_client_ips()
-        if not client_ips:
-            await q.edit_message_text("Нет клиентов.")
-            await asyncio.sleep(1)
-            await show_menu(update, ctx)
-            return
-        lines = []
-        for name, ip, port in client_ips:
-            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
-        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
-        buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
-        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
-        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
-        return
-
-    if data.startswith("ipchg:"):
-        name = data[6:]
-        ip, port = get_client_remote(name)
-        ctx.user_data["action"] = "change_ip"
-        ctx.user_data["change_ip_client"] = name
-        await q.edit_message_text(
-            f"<b>{name}</b>\n\n"
-            f"Текущий IP: <code>{ip or '—'}</code>\n"
-            f"Порт: <code>{port or '—'}</code>\n\n"
-            f"Введи новый IP адрес:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Отмена", callback_data="ip_list")],
-            ])
-        )
-        return
 
     # --- Создать ---
     if data == "create":
@@ -1019,9 +984,42 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
+    # --- IP адреса (фронты) ---
+    if data == "ip_list":
+        client_ips = get_all_client_ips()
+        if not client_ips:
+            await q.edit_message_text("Нет клиентов.")
+            await asyncio.sleep(1)
+            await show_menu(update, ctx)
+            return
+        lines = []
+        for name, ip, port in client_ips:
+            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
+        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
+        buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
+        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data.startswith("ipchg:"):
+        name = data[6:]
+        ip, port = get_client_remote(name)
+        ctx.user_data["action"] = "change_ip"
+        ctx.user_data["change_ip_client"] = name
+        await q.edit_message_text(
+            f"<b>{name}</b>\n\n"
+            f"Текущий IP: <code>{ip or '—'}</code>\n"
+            f"Порт: <code>{port or '—'}</code>\n\n"
+            f"Введи новый IP адрес:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Отмена", callback_data="ip_list")],
+            ])
+        )
+        return
+
     # --- Назад ---
     if data == "back":
-        ctx.user_data.pop("vpn_setup", None)
         ctx.user_data.pop("action", None)
         await show_menu(update, ctx, edit=True)
         return
