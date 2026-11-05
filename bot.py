@@ -327,6 +327,18 @@ def get_all_client_ips() -> list:
     return result
 
 
+def format_ip_table(client_ips: list) -> str:
+    """Форматировать список клиентов с IP в ровную таблицу."""
+    if not client_ips:
+        return ""
+    max_name = max(len(name) for name, _, _ in client_ips)
+    max_ip = max(len(ip) for _, ip, _ in client_ips)
+    lines = []
+    for name, ip, port in client_ips:
+        lines.append(f"{name:<{max_name}}  {ip:>{max_ip}}:{port}")
+    return "<b>📍 IP адреса клиентов</b>\n\n<pre>" + "\n".join(lines) + "</pre>"
+
+
 # ======================== БЭКАП / ВОССТАНОВЛЕНИЕ ========================
 
 import tarfile
@@ -655,10 +667,7 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
         if not client_ips:
             await msg.reply_text("Нет клиентов.")
             return
-        lines = []
-        for name, ip, port in client_ips:
-            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
-        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
+        text = format_ip_table(client_ips)
         buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
         buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
         await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
@@ -992,10 +1001,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(1)
             await show_menu(update, ctx)
             return
-        lines = []
-        for name, ip, port in client_ips:
-            lines.append(f"  <b>{name}</b> → <code>{ip}</code>:{port}")
-        text = f"<b>📍 IP адреса клиентов</b>\n\n" + "\n".join(lines)
+        text = format_ip_table(client_ips)
         buttons = [[InlineKeyboardButton(f"✏️ {name}", callback_data=f"ipchg:{name}")] for name, _, _ in client_ips]
         buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
