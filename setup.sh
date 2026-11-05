@@ -17,39 +17,68 @@ echo "======================================"
 echo ""
 
 # --- 1. Зависимости ---
-echo "[1/3] Устанавливаю зависимости..."
-apt update -qq || true
-apt install -y python3 python3-pip curl git -qq
-if [ $? -ne 0 ]; then
-    echo "  ❌ Ошибка установки пакетов"
+echo "[1/4] Проверяю репозитории..."
+
+# Фикс для старых Debian (bullseye и т.д.) — security.debian.org отдаёт 404
+# Переключаем на архивное зеркало
+fix_repos() {
+    local changed=0
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -f "$f" ] || continue
+        if grep -q "security.debian.org" "$f" 2>/dev/null; then
+            sed -i 's|http://security.debian.org/debian-security|http://deb.debian.org/debian-security|g' "$f"
+            changed=1
+        fi
+    done
+    if [ "$changed" -eq 1 ]; then
+        echo "  ✓ Репозитории обновлены"
+    fi
+}
+
+# Пробуем apt update, если 404 — чиним
+apt update -qq 2>&1 | tail -1
+if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo "  Репозитории устарели, исправляю..."
+    fix_repos
+    apt update -qq 2>&1 | tail -1
+fi
+
+echo "[2/4] Устанавливаю зависимости..."
+
+# python3 и curl скорее всего есть, git и pip — нет
+# Ставим только то что реально нужно, без -dev пакетов
+apt install -y git python3-pip 2>&1 | tail -5
+if ! command -v git &>/dev/null; then
+    echo "  ❌ Не удалось установить git"
+    echo "  Попробуй вручную: apt update && apt install -y git python3-pip"
     exit 1
 fi
 
 pip install python-telegram-bot --break-system-packages -q 2>/dev/null \
   || pip install python-telegram-bot -q 2>/dev/null \
   || pip3 install python-telegram-bot --break-system-packages -q 2>/dev/null \
-  || pip3 install python-telegram-bot -q
-if [ $? -ne 0 ]; then
-    echo "  ❌ Ошибка установки python-telegram-bot"
+  || pip3 install python-telegram-bot -q 2>/dev/null
+if ! python3 -c "import telegram" 2>/dev/null; then
+    echo "  ❌ Не удалось установить python-telegram-bot"
     exit 1
 fi
 echo "  ✓ Python + telegram-bot + git установлены"
 
-# --- 2. Скачать бота ---
-echo "[2/3] Скачиваю бота..."
+# --- 3. Скачать бота ---
+echo "[3/4] Скачиваю бота..."
 if [ -d "/root/alertmob" ]; then
     cd /root/alertmob && git pull -q
 else
     git clone -q https://github.com/XSFORM/alertmob.git /root/alertmob
 fi
-if [ $? -ne 0 ]; then
+if [ ! -f "/root/alertmob/bot.py" ]; then
     echo "  ❌ Ошибка скачивания бота"
     exit 1
 fi
 echo "  ✓ alertmob готов"
 
-# --- 3. Настройка ---
-echo "[3/3] Настройка Telegram бота..."
+# --- 4. Настройка ---
+echo "[4/4] Настройка Telegram бота..."
 echo ""
 
 # Принять из аргументов (bash -s -- TOKEN ID) или спросить
@@ -70,7 +99,7 @@ if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
             if [ -z "$BOT_TOKEN" ]; then
                 echo "  ❌ Токен не может быть пустым"
             elif [[ "$BOT_TOKEN" != *":"* ]]; then
-                echo "  ❌ Неверный формат токена (пример: 123456:ABC...)"
+                echo "  ❌ Неверный формат (пример: 123456:ABC...)"
             else
                 break
             fi
@@ -89,7 +118,6 @@ if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
     fi
 fi
 
-# Финальная проверка
 if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
     echo "  ❌ TOKEN и ADMIN_ID обязательны!"
     exit 1
