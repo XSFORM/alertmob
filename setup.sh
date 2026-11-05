@@ -16,41 +16,57 @@ echo "  AlertMob — Setup"
 echo "======================================"
 echo ""
 
-# --- 1. Зависимости ---
+# --- 1. Фикс репозиториев (Debian EOL) ---
 echo "[1/4] Проверяю репозитории..."
 
-# Фикс для старых Debian (bullseye и т.д.) — security.debian.org отдаёт 404
-# Переключаем на архивное зеркало
-fix_repos() {
-    local changed=0
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+# Определяем кодовое имя дистрибутива
+CODENAME=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
+
+# Debian bullseye и старше — security.debian.org больше не работает
+# Переключаем на archive.debian.org
+fix_eol_repos() {
+    echo "  Debian $CODENAME — переключаю на archive.debian.org..."
+    # Бэкап
+    cp /etc/apt/sources.list /etc/apt/sources.list.bak 2>/dev/null
+
+    # Заменяем все зеркала на archive
+    sed -i 's|http://security.debian.org[^ ]*|http://archive.debian.org/debian-security|g' /etc/apt/sources.list
+    sed -i 's|http://deb.debian.org/debian |http://archive.debian.org/debian |g' /etc/apt/sources.list
+    sed -i 's|http://httpredir.debian.org/debian |http://archive.debian.org/debian |g' /etc/apt/sources.list
+
+    # Тоже в sources.list.d
+    for f in /etc/apt/sources.list.d/*.list; do
         [ -f "$f" ] || continue
-        if grep -q "security.debian.org" "$f" 2>/dev/null; then
-            sed -i 's|http://security.debian.org/debian-security|http://deb.debian.org/debian-security|g' "$f"
-            changed=1
-        fi
+        sed -i 's|http://security.debian.org[^ ]*|http://archive.debian.org/debian-security|g' "$f"
+        sed -i 's|http://deb.debian.org/debian |http://archive.debian.org/debian |g' "$f"
     done
-    if [ "$changed" -eq 1 ]; then
-        echo "  ✓ Репозитории обновлены"
-    fi
+    echo "  ✓ Репозитории переключены на архив"
 }
 
-# Пробуем apt update, если 404 — чиним
-apt update -qq 2>&1 | tail -1
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo "  Репозитории устарели, исправляю..."
-    fix_repos
-    apt update -qq 2>&1 | tail -1
+# Пробуем обновить; если 404 — чиним
+apt_ok=0
+if apt update -qq 2>&1 | grep -qi "404\|failed to fetch"; then
+    fix_eol_repos
+    apt -o Acquire::Check-Valid-Until=false update -qq 2>&1 | tail -1
+    apt_ok=$?
+else
+    apt_ok=0
 fi
 
+# Для archive.debian.org нужен этот флаг постоянно
+if grep -q "archive.debian.org" /etc/apt/sources.list 2>/dev/null; then
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid
+fi
+
+echo "  ✓ Репозитории готовы"
+
+# --- 2. Зависимости ---
 echo "[2/4] Устанавливаю зависимости..."
 
-# python3 и curl скорее всего есть, git и pip — нет
-# Ставим только то что реально нужно, без -dev пакетов
-apt install -y git python3-pip 2>&1 | tail -5
+apt install -y git python3-pip 2>&1 | tail -3
 if ! command -v git &>/dev/null; then
     echo "  ❌ Не удалось установить git"
-    echo "  Попробуй вручную: apt update && apt install -y git python3-pip"
+    echo "  Проверь вывод выше и попробуй: apt install -y git python3-pip"
     exit 1
 fi
 
@@ -81,11 +97,9 @@ echo "  ✓ alertmob готов"
 echo "[4/4] Настройка Telegram бота..."
 echo ""
 
-# Принять из аргументов (bash -s -- TOKEN ID) или спросить
 BOT_TOKEN="${1:-}"
 ADMIN_ID="${2:-}"
 
-# Если не переданы — спросить интерактивно через /dev/tty
 if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
     if [ ! -e /dev/tty ]; then
         echo "  ❌ Не могу спросить TOKEN/ID — /dev/tty недоступен."
@@ -123,7 +137,6 @@ if [ -z "$BOT_TOKEN" ] || [ -z "$ADMIN_ID" ]; then
     exit 1
 fi
 
-# Записать config.json
 cat > /root/alertmob/config.json << EOF
 {
   "token": "${BOT_TOKEN}",
