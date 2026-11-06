@@ -961,24 +961,36 @@ def build_monitor_text() -> str:
     tot_rx = sum(r.get("total_rx", 0) for r in traffic.values())
     tot_tx = sum(r.get("total_tx", 0) for r in traffic.values())
 
-    lines = []
-    for c in sorted(all_clients):
-        rec = traffic.get(c, {})
-        cum = f"всего ↓{fmt_bytes(rec.get('total_rx', 0))} ↑{fmt_bytes(rec.get('total_tx', 0))}"
+    names = sorted(all_clients)
+    # Ширины колонок для ровного выравнивания в моноширинном блоке
+    maxname = max((len(c) for c in names), default=4)
+    rx_strs = {c: fmt_bytes(traffic.get(c, {}).get("total_rx", 0)) for c in names}
+    tx_strs = {c: fmt_bytes(traffic.get(c, {}).get("total_tx", 0)) for c in names}
+    maxrx = max((len(s) for s in rx_strs.values()), default=3)
+    maxtx = max((len(s) for s in tx_strs.values()), default=3)
+
+    rows = []       # моноширинные строки (эмодзи в конце, чтобы не сбивать колонки)
+    extra = []      # доп. строки по онлайн-клиентам (под таблицей)
+    for c in names:
+        row = f"{c:<{maxname}}  ↓{rx_strs[c]:>{maxrx}}  ↑{tx_strs[c]:>{maxtx}}"
         if c in disabled:
-            lines.append(f"⛔ {c} (откл.) · {cum}")
+            rows.append(f"{row}  ⛔")
         elif c in online:
+            rows.append(f"{row}  🟢")
             info = online[c]
             vip = info.get("virtual_addr", "?")
-            rx, tx = int(info.get("rx", 0) or 0), int(info.get("tx", 0) or 0)
-            lines.append(
-                f"🟢 <b>{c}</b>  {vip}\n"
-                f"     сессия ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)} · {cum}"
-            )
+            srx, stx = int(info.get("rx", 0) or 0), int(info.get("tx", 0) or 0)
+            extra.append(f"🟢 <b>{c}</b> {vip} · сессия ↓{fmt_bytes(srx)} ↑{fmt_bytes(stx)}")
         else:
-            lines.append(f"🔴 {c} · {cum}")
+            rows.append(f"{row}  🔴")
 
-    client_block = "\n".join(lines) if lines else "Нет клиентов"
+    if rows:
+        client_block = "<pre>" + "\n".join(rows) + "</pre>"
+    else:
+        client_block = "Нет клиентов"
+    if extra:
+        client_block += "\n" + "\n".join(extra)
+
     server = get_server_stats()
     return (
         f"<b>Мониторинг</b>\n\n"
