@@ -429,6 +429,13 @@ def sync_ip_track() -> dict:
     return ip_map
 
 
+async def run_blocking(fn, *args):
+    """Запустить блокирующую функцию в отдельном потоке.
+    Совместимо с Python 3.8 (asyncio.to_thread появился только в 3.9)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args))
+
+
 def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
              cmd_timeout: int = None) -> tuple:
     """Выполнить команду на удалённом сервере по SSH. → (success, output)"""
@@ -579,7 +586,7 @@ async def ip_block_monitor(app):
             # Проверить каждый уникальный IP
             for front_ip, clients in ip_map.items():
                 try:
-                    status, _detail = await asyncio.to_thread(
+                    status, _detail = await run_blocking(
                         check_front_status, front_ip, ssh_user, ssh_pass
                     )
                 except Exception as e:
@@ -1468,7 +1475,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ssh_user = srv.get("ssh_user") or load_config().get("front_ssh_user", "")
         ssh_pass = srv.get("ssh_pass") or load_config().get("front_ssh_pass", "")
         try:
-            status, _ = await asyncio.to_thread(
+            status, _ = await run_blocking(
                 check_front_status, srv["ip"], ssh_user, ssh_pass
             )
         except Exception:
@@ -1559,7 +1566,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "nohup bash /tmp/gost_install.sh > /tmp/gost_install.log 2>&1 & "
             "echo BG_OK"
         )
-        ok, out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd)
+        ok, out = await run_blocking(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], start_cmd)
         if not ok or "BG_OK" not in out:
             await q.message.reply_text(
                 f"❌ Не удалось запустить установку на {ip}:\n<pre>{html_escape.escape(out[:2000])}</pre>",
@@ -1572,7 +1579,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for attempt in range(30):
             await asyncio.sleep(10)
             elapsed = (attempt + 1) * 10
-            ok2, log_out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], check_cmd)
+            ok2, log_out = await run_blocking(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], check_cmd)
             if "GOST_OK:" in log_out:
                 ver = log_out.split("GOST_OK:")[-1].split("\n")[0].split("__")[0].strip()
                 await q.message.reply_text(
@@ -1685,7 +1692,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"echo -e '{service_content}' > {GOST_SERVICE_PATH} && "
             "systemctl daemon-reload && systemctl enable gost && systemctl restart gost && echo GOST_CONF_OK"
         )
-        ok, out = await asyncio.to_thread(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
+        ok, out = await run_blocking(ssh_exec, ip, 22, srv["ssh_user"], srv["ssh_pass"], cmd)
         back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=f"gost_rules:{cname}")]])
         if ok and "GOST_CONF_OK" in out:
             rules_txt = "\n".join(
@@ -1794,7 +1801,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         test_ip = next(iter(ip_map), None) if ip_map else None
         if test_ip:
             await update.message.reply_text(f"Проверяю SSH {ssh_user}@{test_ip}...")
-            ok, out = await asyncio.to_thread(ssh_exec, test_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
+            ok, out = await run_blocking(ssh_exec, test_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
             if ok and "SSH_OK" in out:
                 await update.message.reply_text(
                     f"✅ SSH настроен и проверен!\n\n"
@@ -1851,7 +1858,7 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # Проверить SSH подключение
         await update.message.reply_text(f"Проверяю SSH {ssh_user}@{front_ip}...")
-        ok, out = await asyncio.to_thread(ssh_exec, front_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
+        ok, out = await run_blocking(ssh_exec, front_ip, 22, ssh_user, ssh_pass, "echo SSH_OK")
         if ok and "SSH_OK" in out:
             fronts = load_front_servers()
             fronts[client_name] = {
