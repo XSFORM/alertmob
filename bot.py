@@ -584,6 +584,12 @@ async def ip_block_monitor(app):
         try:
             await asyncio.sleep(IP_CHECK_INTERVAL)
 
+            # Накопить трафик по клиентам (работает независимо от SSH-мониторинга)
+            try:
+                accumulate_traffic()
+            except Exception as e:
+                log.error(f"[traffic] accumulate error: {e}")
+
             # Глобальные SSH-данные из конфига
             cfg = load_config()
             ssh_user = cfg.get("front_ssh_user", "").strip()
@@ -882,6 +888,108 @@ def get_server_stats() -> str:
     return "\n".join(lines) if lines else "Нет данных"
 
 
+# ======================== НАКОПИТЕЛЬНЫЙ ТРАФИК ПО КЛИЕНТАМ ========================
+
+TRAFFIC_FILE = os.path.join(BOT_DIR, "traffic.json")
+
+
+def load_traffic() -> dict:
+    """{client: {total_rx, total_tx, last_rx, last_tx}}"""
+    if os.path.exists(TRAFFIC_FILE):
+        try:
+            with open(TRAFFIC_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_traffic(data: dict):
+    tmp = TRAFFIC_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, TRAFFIC_FILE)
+
+
+def accumulate_traffic() -> dict:
+    """Снять счётчики сессий из status.log и прибавить к накопительным.
+    Счётчик сессии OpenVPN обнуляется при переподключении — ловим это
+    по уменьшению значения (cur < last) и считаем дельту корректно.
+    Функция синхронная (без await), поэтому в event loop выполняется атомарно."""
+    live = parse_status_log()
+    data = load_traffic()
+    changed = False
+
+    for client, info in live.items():
+        cur_rx = int(info.get("rx", 0) or 0)
+        cur_tx = int(info.get("tx", 0) or 0)
+        rec = data.setdefault(client, {"total_rx": 0, "total_tx": 0, "last_rx": 0, "last_tx": 0})
+        d_rx = cur_rx - rec["last_rx"] if cur_rx >= rec["last_rx"] else cur_rx
+        d_tx = cur_tx - rec["last_tx"] if cur_tx >= rec["last_tx"] else cur_tx
+        if d_rx or d_tx:
+            rec["total_rx"] += d_rx
+            rec["total_tx"] += d_tx
+            changed = True
+        if rec["last_rx"] != cur_rx or rec["last_tx"] != cur_tx:
+            rec["last_rx"] = cur_rx
+            rec["last_tx"] = cur_tx
+            changed = True
+
+    # Отключившиеся: обнулить last_*, чтобы новую сессию считать с нуля
+    for client, rec in data.items():
+        if client not in live and (rec.get("last_rx") or rec.get("last_tx")):
+            rec["last_rx"] = 0
+            rec["last_tx"] = 0
+            changed = True
+
+    if changed:
+        save_traffic(data)
+    return data
+
+
+def build_monitor_text() -> str:
+    """Собрать текст экрана мониторинга: онлайн, сессия, накопительный трафик по клиентам."""
+    online = parse_status_log()
+    all_clients = list_clients()
+    disabled = get_disabled_clients()
+    traffic = accumulate_traffic()
+
+    sess_rx = sum(int(online[c].get("rx", 0) or 0) for c in online)
+    sess_tx = sum(int(online[c].get("tx", 0) or 0) for c in online)
+    tot_rx = sum(r.get("total_rx", 0) for r in traffic.values())
+    tot_tx = sum(r.get("total_tx", 0) for r in traffic.values())
+
+    lines = []
+    for c in sorted(all_clients):
+        rec = traffic.get(c, {})
+        cum = f"всего ↓{fmt_bytes(rec.get('total_rx', 0))} ↑{fmt_bytes(rec.get('total_tx', 0))}"
+        if c in disabled:
+            lines.append(f"⛔ {c} (откл.) · {cum}")
+        elif c in online:
+            info = online[c]
+            vip = info.get("virtual_addr", "?")
+            rx, tx = int(info.get("rx", 0) or 0), int(info.get("tx", 0) or 0)
+            lines.append(
+                f"🟢 <b>{c}</b>  {vip}\n"
+                f"     сессия ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)} · {cum}"
+            )
+        else:
+            lines.append(f"🔴 {c} · {cum}")
+
+    client_block = "\n".join(lines) if lines else "Нет клиентов"
+    server = get_server_stats()
+    return (
+        f"<b>Мониторинг</b>\n\n"
+        f"Online: {len(online)} / {len(all_clients)}\n"
+        f"Сессия: ↓{fmt_bytes(sess_rx)} ↑{fmt_bytes(sess_tx)}\n"
+        f"Всего: ↓{fmt_bytes(tot_rx)} ↑{fmt_bytes(tot_tx)}\n\n"
+        f"{client_block}\n\n"
+        f"<b>Сервер:</b>\n{server}"
+    )
+
+
 # ======================== TELEGRAM BOT ========================
 
 ADMIN_ID = 0  # Заполняется при старте
@@ -956,31 +1064,11 @@ async def handle_quick(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: s
         return
 
     if action == "monitor":
-        online = parse_status_log()
-        all_clients = list_clients()
-        disabled = get_disabled_clients()
-        lines = []
-        total_rx, total_tx = 0, 0
-        for c in sorted(all_clients):
-            if c in disabled:
-                lines.append(f"  ⛔ {c}  (отключён)")
-            elif c in online:
-                info = online[c]
-                vip = info.get("virtual_addr", "?")
-                rx, tx = info.get("rx", 0), info.get("tx", 0)
-                total_rx += rx
-                total_tx += tx
-                lines.append(f"  🟢 <b>{c}</b>  {vip}  ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)}")
-            else:
-                lines.append(f"  🔴 {c}")
-        client_block = "\n".join(lines) if lines else "Нет клиентов"
-        server = get_server_stats()
-        text = (
-            f"<b>Мониторинг</b>\n\nOnline: {len(online)} / {len(all_clients)}\n"
-            f"Трафик сессии: ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}\n\n"
-            f"{client_block}\n\n<b>Сервер:</b>\n{server}"
-        )
-        buttons = [[InlineKeyboardButton("Обновить", callback_data="monitor")]]
+        text = build_monitor_text()
+        buttons = [
+            [InlineKeyboardButton("Обновить", callback_data="monitor")],
+            [InlineKeyboardButton("🗑 Сбросить трафик", callback_data="traffic_reset")],
+        ]
         await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
         return
 
@@ -1320,38 +1408,36 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- Мониторинг ---
     if data == "monitor":
-        online = parse_status_log()
-        all_clients = list_clients()
-
-        lines = []
-        total_rx, total_tx = 0, 0
-
-        for c in sorted(all_clients):
-            if c in online:
-                info = online[c]
-                vip = info.get("virtual_addr", "?")
-                rx, tx = info.get("rx", 0), info.get("tx", 0)
-                total_rx += rx
-                total_tx += tx
-                lines.append(f"  🟢 <b>{c}</b>  {vip}  ↓{fmt_bytes(rx)} ↑{fmt_bytes(tx)}")
-            else:
-                lines.append(f"  🔴 {c}")
-
-        client_block = "\n".join(lines) if lines else "Нет клиентов"
-        server = get_server_stats()
-
-        text = (
-            f"<b>Мониторинг</b>\n\n"
-            f"Online: {len(online)} / {len(all_clients)}\n"
-            f"Трафик сессии: ↓{fmt_bytes(total_rx)} ↑{fmt_bytes(total_tx)}\n\n"
-            f"{client_block}\n\n"
-            f"<b>Сервер:</b>\n{server}"
-        )
+        text = build_monitor_text()
         buttons = [
             [InlineKeyboardButton("Обновить", callback_data="monitor")],
+            [InlineKeyboardButton("🗑 Сбросить трафик", callback_data="traffic_reset")],
             [InlineKeyboardButton("Назад", callback_data="back")],
         ]
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="HTML")
+        return
+
+    if data == "traffic_reset":
+        buttons = [
+            [InlineKeyboardButton("✅ Да, обнулить", callback_data="traffic_reset_yes")],
+            [InlineKeyboardButton("Отмена", callback_data="monitor")],
+        ]
+        await q.edit_message_text(
+            "Обнулить накопительный трафик по всем клиентам?\n"
+            "Текущие сессии продолжат считаться с нуля.",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+
+    if data == "traffic_reset_yes":
+        try:
+            save_traffic({})
+        except Exception as e:
+            log.error(f"[traffic] reset error: {e}")
+        await q.edit_message_text(
+            "✅ Накопительный трафик обнулён.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("К мониторингу", callback_data="monitor")]])
+        )
         return
 
     # --- GOST / Фронт-серверы ---
