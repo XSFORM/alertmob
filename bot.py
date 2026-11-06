@@ -462,12 +462,49 @@ def ssh_exec(ip: str, port: int, user: str, password: str, command: str,
         client.close()
 
 
-def ping_via_ssh(host: str, user: str, password: str, target: str) -> bool:
-    """SSH на host, пинг target. True = пинг прошёл."""
-    ok, out = ssh_exec(host, 22, user, password, f"ping -c 1 -W 3 {target}")
-    if ok and ("1 received" in out or "bytes from" in out):
+# Нейтральный IP для контрольного пинга — отделяет «у фронта нет сети»
+# от «TM заблокировал именно этот IP».
+NET_CONTROL_IP = "1.1.1.1"
+
+
+def ping_via_ssh(host: str, user: str, password: str, target: str,
+                 count: int = 5) -> bool:
+    """SSH на host, пинг target несколькими пакетами.
+    True = ответил хоть один пакет (цель достижима)."""
+    ok, out = ssh_exec(host, 22, user, password, f"ping -c {count} -W 2 {target}")
+    if not ok:
+        return False
+    # Любой полученный пакет = цель доступна. TM-зонд часто режет ICMP,
+    # поэтому одного пакета мало — смотрим, вернулся ли хоть один из count.
+    if "bytes from" in out:
+        return True
+    m = re.search(r"(\d+)\s+received", out)
+    if m and int(m.group(1)) > 0:
         return True
     return False
+
+
+def check_front_status(host: str, user: str, password: str) -> tuple:
+    """Проверить фронт одной SSH-сессией.
+    Возврат: (status, detail)
+      'ok'         — фронт достучался до TM-зонда → IP НЕ заблокирован
+      'blocked'    — у фронта есть интернет, но TM-зонд недоступен → похоже на блок
+      'front_down' — SSH не прошёл или у фронта вообще нет сети → проблема фронта, не блок
+    """
+    cmd = (
+        f"ping -c 5 -W 2 {TM_PROBE_IP} >/dev/null 2>&1 && echo PROBE_OK || echo PROBE_FAIL; "
+        f"ping -c 3 -W 2 {NET_CONTROL_IP} >/dev/null 2>&1 && echo NET_OK || echo NET_FAIL"
+    )
+    ok, out = ssh_exec(host, 22, user, password, cmd)
+    if not ok:
+        return "front_down", out
+    if "PROBE_OK" in out:
+        return "ok", out
+    if "NET_OK" not in out:
+        # Фронт не достучался даже до нейтрального IP — это не блок TM,
+        # а проблема сети самого фронта (или SSH-сессии).
+        return "front_down", out
+    return "blocked", out
 
 
 # ======================== GOST ФУНКЦИИ ========================
@@ -542,23 +579,30 @@ async def ip_block_monitor(app):
             # Проверить каждый уникальный IP
             for front_ip, clients in ip_map.items():
                 try:
-                    ok = await asyncio.to_thread(
-                        ping_via_ssh, front_ip, ssh_user, ssh_pass,
-                        TM_PROBE_IP
+                    status, _detail = await asyncio.to_thread(
+                        check_front_status, front_ip, ssh_user, ssh_pass
                     )
                 except Exception as e:
                     log.error(f"[ip_monitor] SSH error {front_ip}: {e}")
-                    ok = False
+                    status = "front_down"
 
-                if ok:
+                if status == "ok":
                     if ip_fail_counts.get(front_ip, 0) > 0:
-                        log.info(f"[ip_monitor] {front_ip} — пинг ОК, сброс ({', '.join(clients)})")
+                        log.info(f"[ip_monitor] {front_ip} — зонд ОК, сброс ({', '.join(clients)})")
                     ip_fail_counts[front_ip] = 0
                     continue
 
+                if status == "front_down":
+                    # Не считаем блоком: нет сети на фронте или SSH-сбой.
+                    # Сбрасываем счётчик, чтобы не копить ложные страйки.
+                    log.warning(f"[ip_monitor] {front_ip} — фронт недоступен / нет сети (не блок)")
+                    ip_fail_counts[front_ip] = 0
+                    continue
+
+                # status == "blocked": у фронта есть интернет, но TM-зонд недоступен
                 ip_fail_counts[front_ip] = ip_fail_counts.get(front_ip, 0) + 1
                 count = ip_fail_counts[front_ip]
-                log.warning(f"[ip_monitor] {front_ip} — FAIL #{count}/{IP_FAIL_THRESHOLD} ({', '.join(clients)})")
+                log.warning(f"[ip_monitor] {front_ip} — BLOCKED-страйк #{count}/{IP_FAIL_THRESHOLD} ({', '.join(clients)})")
 
                 if count >= IP_FAIL_THRESHOLD:
                     ip_fail_counts[front_ip] = 0  # сбросить, чтобы не спамить
@@ -570,7 +614,8 @@ async def ip_block_monitor(app):
                                 f"🚫 <b>IP ЗАБЛОКИРОВАН</b>\n\n"
                                 f"IP: <code>{front_ip}</code>\n"
                                 f"Ключи: {clients_str}\n"
-                                f"Пинг {TM_PROBE_IP} не прошёл {IP_FAIL_THRESHOLD} раз подряд.\n\n"
+                                f"TM-зонд {TM_PROBE_IP} недоступен {IP_FAIL_THRESHOLD} раз подряд,\n"
+                                f"при этом у фронта есть интернет.\n\n"
                                 f"Нужна смена IP!"
                             ),
                             parse_mode="HTML"
@@ -1419,17 +1464,24 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Фронт не найден.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="front_list")]]))
             return
-        await q.edit_message_text(f"🔍 Проверяю пинг {srv['ip']}...")
+        await q.edit_message_text(f"🔍 Проверяю {srv['ip']}...")
+        ssh_user = srv.get("ssh_user") or load_config().get("front_ssh_user", "")
+        ssh_pass = srv.get("ssh_pass") or load_config().get("front_ssh_pass", "")
         try:
-            ok = await asyncio.to_thread(
-                ping_via_ssh, srv["ip"], srv["ssh_user"], srv["ssh_pass"], TM_PROBE_IP
+            status, _ = await asyncio.to_thread(
+                check_front_status, srv["ip"], ssh_user, ssh_pass
             )
-        except Exception as e:
-            ok = False
-        if ok:
-            result = f"✅ Пинг <code>{srv['ip']}</code> → {TM_PROBE_IP} — <b>ОК</b>"
+        except Exception:
+            status = "front_down"
+        if status == "ok":
+            result = (f"✅ <code>{srv['ip']}</code> → зонд {TM_PROBE_IP} — <b>ОК</b>\n"
+                      f"IP НЕ заблокирован.")
+        elif status == "blocked":
+            result = (f"🚫 <code>{srv['ip']}</code> → зонд {TM_PROBE_IP} — <b>НЕТ ОТВЕТА</b>\n"
+                      f"У фронта есть интернет — похоже на блок TM.")
         else:
-            result = f"❌ Пинг <code>{srv['ip']}</code> → {TM_PROBE_IP} — <b>НЕТ ОТВЕТА</b>"
+            result = (f"⚠️ <code>{srv['ip']}</code> — <b>ФРОНТ НЕДОСТУПЕН</b>\n"
+                      f"Нет сети на фронте или SSH не прошёл. Это не блок TM.")
         await q.message.reply_text(result, parse_mode="HTML")
         # Вернуть детали фронта
         rules_text = ""
