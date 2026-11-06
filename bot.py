@@ -352,9 +352,11 @@ SSH_CMD_TIMEOUT = 30
 
 # IP-мониторинг (автоматический, по данным из .ovpn файлов)
 TM_PROBE_IP = "217.174.235.161"
-IP_FAIL_THRESHOLD = 3
-IP_CHECK_INTERVAL = 60  # секунд
-ip_fail_counts = {}  # {ip: int}
+IP_FAIL_THRESHOLD = 3       # страйков подряд → "TM заблокировал" (~3 мин)
+HOST_DOWN_THRESHOLD = 5     # страйков подряд → "хостинг недоступен" (~5 мин)
+IP_CHECK_INTERVAL = 60      # секунд
+# Состояние каждого IP: {ip: {"block": int, "down": int, "alerted": None|"blocked"|"down"}}
+ip_state = {}
 
 # GOST
 GOST_BIN = "/usr/local/bin/gost"
@@ -559,14 +561,25 @@ def gost_build_service(rules: list) -> str:
 # ======================== IP МОНИТОР (ФОНОВЫЙ) ========================
 
 
+async def _notify(app, text):
+    try:
+        await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        log.error(f"[ip_monitor] Не удалось отправить уведомление: {e}")
+
+
 async def ip_block_monitor(app):
     """Фоновая задача: каждые 60 сек читает IP из .ovpn файлов,
-    SSH-ится на каждый фронт и пингует TM-зонд (217.174.235.161).
-    Если 3 раза подряд пинг не проходит — IP заблокирован, шлём уведомление.
+    SSH-ится на каждый фронт и проверяет TM-зонд (217.174.235.161).
+
+    Три сценария (каждое уведомление приходит ОДИН раз за эпизод + «восстановлен»):
+      TM заблокировал  — зонд молчит, но у фронта есть интернет → 3 страйка (~3 мин)
+      Хостинг упал     — ни зонд, ни контрольный IP, ни SSH → 5 страйков (~5 мин)
+      Восстановление   — после тревоги фронт снова ОК → «✅ восстановлен»
 
     SSH-логин/пароль берутся из config.json (front_ssh_user / front_ssh_pass).
     IP автоматически берутся из .ovpn файлов — не нужно добавлять вручную."""
-    global ip_fail_counts
+    global ip_state
     while True:
         try:
             await asyncio.sleep(IP_CHECK_INTERVAL)
@@ -583,6 +596,10 @@ async def ip_block_monitor(app):
             if not ip_map:
                 continue
 
+            # Убрать из состояния IP, которых больше нет в .ovpn
+            for gone in [ip for ip in ip_state if ip not in ip_map]:
+                ip_state.pop(gone, None)
+
             # Проверить каждый уникальный IP
             for front_ip, clients in ip_map.items():
                 try:
@@ -593,42 +610,58 @@ async def ip_block_monitor(app):
                     log.error(f"[ip_monitor] SSH error {front_ip}: {e}")
                     status = "front_down"
 
+                st = ip_state.setdefault(front_ip, {"block": 0, "down": 0, "alerted": None})
+                clients_str = ", ".join(f"<b>{c}</b>" for c in clients)
+
                 if status == "ok":
-                    if ip_fail_counts.get(front_ip, 0) > 0:
-                        log.info(f"[ip_monitor] {front_ip} — зонд ОК, сброс ({', '.join(clients)})")
-                    ip_fail_counts[front_ip] = 0
+                    if st["alerted"] == "blocked":
+                        await _notify(app,
+                            f"✅ <b>IP ВОССТАНОВЛЕН</b>\n\n"
+                            f"IP: <code>{front_ip}</code>\n"
+                            f"Ключи: {clients_str}\n"
+                            f"TM-зонд снова отвечает — блокировка снята.")
+                    elif st["alerted"] == "down":
+                        await _notify(app,
+                            f"✅ <b>ХОСТИНГ ВОССТАНОВЛЕН</b>\n\n"
+                            f"IP: <code>{front_ip}</code>\n"
+                            f"Ключи: {clients_str}\n"
+                            f"Фронт снова на связи.")
+                    if st["block"] or st["down"]:
+                        log.info(f"[ip_monitor] {front_ip} — ОК, сброс ({', '.join(clients)})")
+                    st["block"] = 0
+                    st["down"] = 0
+                    st["alerted"] = None
                     continue
 
-                if status == "front_down":
-                    # Не считаем блоком: нет сети на фронте или SSH-сбой.
-                    # Сбрасываем счётчик, чтобы не копить ложные страйки.
-                    log.warning(f"[ip_monitor] {front_ip} — фронт недоступен / нет сети (не блок)")
-                    ip_fail_counts[front_ip] = 0
+                if status == "blocked":
+                    # У фронта есть интернет, но TM-зонд недоступен → похоже на блок TM
+                    st["down"] = 0
+                    st["block"] += 1
+                    log.warning(f"[ip_monitor] {front_ip} — BLOCK-страйк #{st['block']}/{IP_FAIL_THRESHOLD} ({', '.join(clients)})")
+                    if st["block"] >= IP_FAIL_THRESHOLD and st["alerted"] != "blocked":
+                        st["alerted"] = "blocked"
+                        await _notify(app,
+                            f"🚫 <b>IP ЗАБЛОКИРОВАН (TM)</b>\n\n"
+                            f"IP: <code>{front_ip}</code>\n"
+                            f"Ключи: {clients_str}\n"
+                            f"TM-зонд {TM_PROBE_IP} молчит {IP_FAIL_THRESHOLD} мин подряд,\n"
+                            f"но у фронта есть интернет.\n\n"
+                            f"Нужна смена IP!")
                     continue
 
-                # status == "blocked": у фронта есть интернет, но TM-зонд недоступен
-                ip_fail_counts[front_ip] = ip_fail_counts.get(front_ip, 0) + 1
-                count = ip_fail_counts[front_ip]
-                log.warning(f"[ip_monitor] {front_ip} — BLOCKED-страйк #{count}/{IP_FAIL_THRESHOLD} ({', '.join(clients)})")
-
-                if count >= IP_FAIL_THRESHOLD:
-                    ip_fail_counts[front_ip] = 0  # сбросить, чтобы не спамить
-                    clients_str = ", ".join(f"<b>{c}</b>" for c in clients)
-                    try:
-                        await app.bot.send_message(
-                            chat_id=ADMIN_ID,
-                            text=(
-                                f"🚫 <b>IP ЗАБЛОКИРОВАН</b>\n\n"
-                                f"IP: <code>{front_ip}</code>\n"
-                                f"Ключи: {clients_str}\n"
-                                f"TM-зонд {TM_PROBE_IP} недоступен {IP_FAIL_THRESHOLD} раз подряд,\n"
-                                f"при этом у фронта есть интернет.\n\n"
-                                f"Нужна смена IP!"
-                            ),
-                            parse_mode="HTML"
-                        )
-                    except Exception as e:
-                        log.error(f"[ip_monitor] Не удалось отправить уведомление: {e}")
+                # status == "front_down": ни зонд, ни контрольный IP, ни SSH не отвечают
+                st["block"] = 0
+                st["down"] += 1
+                log.warning(f"[ip_monitor] {front_ip} — DOWN-страйк #{st['down']}/{HOST_DOWN_THRESHOLD} ({', '.join(clients)})")
+                if st["down"] >= HOST_DOWN_THRESHOLD and st["alerted"] != "down":
+                    st["alerted"] = "down"
+                    await _notify(app,
+                        f"⚠️ <b>ХОСТИНГ НЕДОСТУПЕН</b>\n\n"
+                        f"IP: <code>{front_ip}</code>\n"
+                        f"Ключи: {clients_str}\n"
+                        f"Фронт не отвечает {HOST_DOWN_THRESHOLD} мин подряд\n"
+                        f"(ни TM-зонд, ни {NET_CONTROL_IP}, ни SSH).\n\n"
+                        f"Похоже, упал сервер/хостинг — не блокировка TM.")
 
         except asyncio.CancelledError:
             break
